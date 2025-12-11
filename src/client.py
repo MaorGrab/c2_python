@@ -18,6 +18,7 @@ import argparse
 import subprocess
 from typing import Dict
 from message import Message
+from models.send_receive_msgs import send_message, receive_message
 
 # ==================== CONFIGURATION ====================
 
@@ -26,37 +27,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# ==================== MESSAGE HANDLING ====================
-
-async def send_message(writer, message: Message) -> bool:
-    """Send JSON message"""
-    try:
-        logger.info(f"Sending message of type: {message.type}")
-        writer.write(message.to_payload())
-        await writer.drain()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-        return False
-
-async def receive_message(reader) -> Message:
-    """Receive JSON message"""
-    try:
-        length_data = await reader.readexactly(4)
-        length = int.from_bytes(length_data, 'big')
-
-        payload = await reader.readexactly(length)
-        return Message.from_payload(payload)
-    except asyncio.IncompleteReadError:
-        logger.debug("Connection closed")
-        return None
-    except ConnectionResetError:
-        logger.debug("Connection reset by peer")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to receive message: {e}")
-        return None
 
 # ==================== CORE C2 CLIENT LOGIC ====================
 

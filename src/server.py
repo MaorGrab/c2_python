@@ -16,6 +16,7 @@ import uuid
 import argparse
 from typing import Dict
 from message import Message
+from models.send_receive_msgs import send_message, receive_message
 
 # ==================== CONFIGURATION ====================
 
@@ -38,43 +39,6 @@ class ClientState:
         self.last_heartbeat = time.time()
         self.status = "connecting"
         self.pending_results = {}  # {msg_id → result}
-
-# ==================== MESSAGE HANDLING ====================
-
-async def send_message(writer, message: Message) -> bool:
-    """
-    Send JSON message to client
-    Format: length_prefix(4 bytes)
-    """
-    try:        
-        writer.write(message.to_payload())
-        await writer.drain()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-        return False
-
-async def receive_message(reader) -> Message:
-    """
-    Receive JSON message from client
-    """
-    try:
-        # Read length prefix
-        length_data = await reader.readexactly(4)
-        length = int.from_bytes(length_data, 'big')
-        
-        # Read payload
-        payload = await reader.readexactly(length)
-        return Message.from_payload(payload)
-    except asyncio.IncompleteReadError:
-        logger.debug("Connection closed")
-        return None
-    except ConnectionResetError:
-        logger.debug("Connection reset by peer")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to receive message: {e}")
-        return None
 
 # ==================== CORE C2 LOGIC ====================
 
