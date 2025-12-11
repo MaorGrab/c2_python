@@ -60,14 +60,17 @@ async def receive_message(reader) -> Message:
     """
     try:
         # Read length prefix
-        length_data = await asyncio.wait_for(reader.readexactly(4), timeout=30)
+        length_data = await reader.readexactly(4)
         length = int.from_bytes(length_data, 'big')
         
         # Read payload
-        payload = await asyncio.wait_for(reader.readexactly(length), timeout=30)
+        payload = await reader.readexactly(length)
         return Message.from_payload(payload)
-    except asyncio.TimeoutError:
-        logger.warning("Message receive timeout")
+    except asyncio.IncompleteReadError:
+        logger.debug("Connection closed")
+        return None
+    except ConnectionResetError:
+        logger.debug("Connection reset by peer")
         return None
     except Exception as e:
         logger.error(f"Failed to receive message: {e}")
