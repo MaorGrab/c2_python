@@ -36,7 +36,7 @@ class ClientState:
         self.writer = writer
         self.command_queue = asyncio.Queue()
         self.last_heartbeat = time.time()
-        self.status = "connected"
+        self.status = "connecting"
         self.pending_results = {}  # {msg_id → result}
 
 # ==================== MESSAGE HANDLING ====================
@@ -102,6 +102,7 @@ class C2Server:
             
             client_id = msg.client_id or f"client-{uuid.uuid4().hex[:8]}"
             client_state = ClientState(client_id, reader, writer)
+            client_state.status = 'connected'
             
             # Register client
             self.clients[client_id] = client_state
@@ -111,7 +112,9 @@ class C2Server:
             await send_message(writer, Message.as_ack(client_id))
             
             # Main client loop
+            logger.info("awaiting client loop")
             await self._client_loop(client_state)
+            logger.info("done awaiting client loop")
             
         except Exception as e:
             logger.error(f"Client handler error: {e}")
@@ -163,10 +166,11 @@ class C2Server:
         while self.running:
             try:
                 if state.status != "connected":
-                    logger.info(f"Client {state.client_id} not connected, stopping receiver")
+                    logger.info(f"_command_receiver Client {state.client_id} not connected: {state.status}")
                     break
                 msg = await receive_message(state.reader)
                 if not msg:
+                    logger.info(f"_command_receiver for Client {state.client_id} - no msg")
                     break
                 
                 if msg.type == "result":
@@ -190,7 +194,7 @@ class C2Server:
         while self.running:
             try:
                 if state.status != "connected":
-                    logger.info(f"Client {state.client_id} not connected, stopping executor")
+                    logger.info(f"_command_executor Client {state.client_id} not connected: {state.status}")
                     break
                 # Get next command from queue (timeout prevents hanging)
                 cmd_data = await asyncio.wait_for(state.command_queue.get(), timeout=1.0)
