@@ -49,7 +49,8 @@ class C2Server:
         self.host = host
         self.port = port
         self.clients: Dict[str, ClientState] = {}
-        self.running = True
+        self.shutdown = asyncio.Event()   # <-- shared shutdown signal
+        self._server: asyncio.base_events.Server | None = None
     
     async def handle_client(self, reader, writer):
         """
@@ -130,7 +131,7 @@ class C2Server:
         """
         Receive messages from client
         """
-        while self.running:
+        while not self.shutdown.is_set():
             try:
                 if state.status != "connected":
                     logger.info(f"_command_receiver Client {state.client_id} not connected: {state.status}")
@@ -158,7 +159,7 @@ class C2Server:
         STEP 4: Execute commands queued for this client
         Uses asyncio.Queue for serialization
         """
-        while self.running:
+        while not self.shutdown.is_set():
             try:
                 if state.status != "connected":
                     logger.info(f"_command_executor Client {state.client_id} not connected: {state.status}")
@@ -187,21 +188,33 @@ class C2Server:
 
     async def start_server(self):
         """Start the C2 server"""
-        server = await asyncio.start_server(
+        self._server = await asyncio.start_server(
             self.handle_client,
             self.host,
             self.port
         )
         
-        addr = server.sockets[0].getsockname()
+        addr = self._server.sockets[0].getsockname()
         logger.info(f"C2 Server listening on {addr[0]}:{addr[1]}")
         
-        async with server:
+        async with self._server:
             try:
-                await server.serve_forever()
+                logger.info("Server started")
+                # await self._server.serve_forever()
+                await self.shutdown.wait()
+                logger.info("Server received shutdown event")
             except KeyboardInterrupt:
-                logger.info("Server shutdown")
-                self.running = False
+                logger.info("Server received Keyboard Interrupt event")
+            finally:
+                await self.stop()
+                logger.info("Server stopped")
+
+    async def stop(self):
+        """Optional helper to shut down programmatically from elsewhere."""
+        self.shutdown.set()
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
     
     # ==================== ADMIN CLI (STEP 1) ====================
     
@@ -278,7 +291,7 @@ class C2Server:
         """
         loop = asyncio.get_event_loop()
         
-        while self.running:
+        while not self.shutdown.is_set():
             try:
                 # Run input in executor to avoid blocking
                 cmd = await loop.run_in_executor(None, input, "> ")
@@ -293,8 +306,8 @@ class C2Server:
                     self.cmd_kill(cmd[5:].strip())
                 
                 elif cmd.startswith("exit"):
-                    self.running = False
-                    break
+                    logger.info('Exiting server')
+                    self.shutdown.set()
                 
                 elif cmd == "help":
                     print("""
