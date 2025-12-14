@@ -18,6 +18,7 @@ from typing import Dict
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.client_state import ClientState
+from models.message_type import MessageType
 
 # ==================== CONFIGURATION ====================
 
@@ -50,8 +51,9 @@ class C2Server:
         try:
             # Receive registration message
             msg = await receive_message(reader)
-            if not msg or msg.type != "register":
-                logger.warning("Invalid registration message")
+            if not msg or msg.type is not MessageType.REGISTER:
+                print(type(msg.type))
+                logger.warning(f"Invalid registration message: {msg.type} of type {type(msg.type)}")
                 writer.close()
                 return
             
@@ -106,7 +108,7 @@ class C2Server:
                     logger.info(f"_command_receiver for Client {client_state.client_id} - no msg")
                     break
                 
-                if msg.type == "result":
+                if msg.type is MessageType.RESULT:
                     logger.info(f"Result from {client_state.client_id}: {msg.result[:100]}")
                     
                     if msg.cmd_id in client_state.pending_results:

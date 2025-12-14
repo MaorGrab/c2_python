@@ -19,6 +19,7 @@ import subprocess
 from typing import Dict
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
+from models.message_type import MessageType
 
 # ==================== CONFIGURATION ====================
 
@@ -62,7 +63,7 @@ class C2Client:
             # Receive acknowledgment
             logger.info("Waiting for acknowledgment...")
             ack = await receive_message(self.reader)
-            if ack and ack.type == "ack":
+            if ack and ack.type is MessageType.ACK:
                 logger.info(f"Registered as {ack.client_id}")
                 return True
             else:
@@ -140,7 +141,7 @@ class C2Client:
                     logger.info("Server closed connection")
                     break
                 
-                if msg.type == "command":
+                if msg.type is MessageType.COMMAND:
                     # Queue command for execution
                     await self.command_queue.put({
                         "cmd_id": msg.cmd_id,
