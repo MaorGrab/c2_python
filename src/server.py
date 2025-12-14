@@ -17,6 +17,7 @@ import argparse
 from typing import Dict
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
+from models.client_state import ClientState
 
 # ==================== CONFIGURATION ====================
 
@@ -25,20 +26,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# ==================== CLIENT STATE MANAGEMENT ====================
-
-class ClientState:
-    """Tracks state for each connected client"""
-    
-    def __init__(self, client_id: str, reader, writer):
-        self.client_id = client_id
-        self.reader = reader
-        self.writer = writer
-        self.command_queue = asyncio.Queue()
-        self.last_heartbeat = time.time()
-        self.status = "connecting"
-        self.pending_results = {}  # {msg_id → result}
 
 # ==================== CORE C2 LOGIC ====================
 
@@ -70,7 +57,7 @@ class C2Server:
             
             client_id = msg.client_id or f"client-{uuid.uuid4().hex[:8]}"
             client_state = ClientState(client_id, reader, writer)
-            client_state.status = 'connected'
+            client_state.set_connected()
             
             # Register client
             self.clients[client_id] = client_state
@@ -87,12 +74,12 @@ class C2Server:
         except Exception as e:
             logger.error(f"Client handler error: {e}")
 
-    async def _client_loop(self, state: ClientState):
+    async def _client_loop(self, client_state: ClientState):
         """
         Main loop for client communication
         """
-        command_receiver = asyncio.create_task(self._command_receiver(state))
-        command_executor = asyncio.create_task(self._command_executor(state))
+        command_receiver = asyncio.create_task(self._command_receiver(client_state))
+        command_executor = asyncio.create_task(self._command_executor(client_state))
         
         try:
             await asyncio.gather(
@@ -105,25 +92,25 @@ class C2Server:
             command_receiver.cancel()
             command_executor.cancel()
 
-    async def _command_receiver(self, state: ClientState):
+    async def _command_receiver(self, client_state: ClientState):
         """
         Receive messages from client
         """
         while not self.shutdown.is_set():
             try:
-                if state.status != "connected":
-                    logger.info(f"_command_receiver Client {state.client_id} not connected: {state.status}")
+                if not client_state.is_connected:
+                    logger.info(f"_command_receiver Client {client_state.client_id} not connected: {client_state.status}")
                     break
-                msg = await receive_message(state.reader)
+                msg = await receive_message(client_state.reader)
                 if not msg:
-                    logger.info(f"_command_receiver for Client {state.client_id} - no msg")
+                    logger.info(f"_command_receiver for Client {client_state.client_id} - no msg")
                     break
                 
                 if msg.type == "result":
-                    logger.info(f"Result from {state.client_id}: {msg.result[:100]}")
+                    logger.info(f"Result from {client_state.client_id}: {msg.result[:100]}")
                     
-                    if msg.cmd_id in state.pending_results:
-                        del state.pending_results[msg.cmd_id]
+                    if msg.cmd_id in client_state.pending_results:
+                        del client_state.pending_results[msg.cmd_id]
                 
                 else:
                     logger.warning(f"Unknown message type: {msg.type}")
@@ -132,31 +119,31 @@ class C2Server:
                 logger.error(f"Command receiver error: {e}")
                 break
     
-    async def _command_executor(self, state: ClientState):
+    async def _command_executor(self, client_state: ClientState):
         """
         STEP 4: Execute commands queued for this client
         Uses asyncio.Queue for serialization
         """
         while not self.shutdown.is_set():
             try:
-                if state.status != "connected":
-                    logger.info(f"_command_executor Client {state.client_id} not connected: {state.status}")
+                if not client_state.is_connected:
+                    logger.info(f"_command_executor Client {client_state.client_id} not connected: {client_state.status}")
                     break
                 # Get next command from queue (timeout prevents hanging)
-                cmd_data = await asyncio.wait_for(state.command_queue.get(), timeout=1.0)
+                cmd_data = await asyncio.wait_for(client_state.command_queue.get(), timeout=1.0)
                 
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command")
                 
                 # Track pending result
-                state.pending_results[cmd_id] = command
+                client_state.pending_results[cmd_id] = command
                 
                 # Send command to client
                 await send_message(
-                    state.writer,
+                    client_state.writer,
                     Message.as_command(cmd_id, command)
                 )
-                logger.info(f"Command sent to {state.client_id}: {command}")
+                logger.info(f"Command sent to {client_state.client_id}: {command}")
             
             except asyncio.TimeoutError:
                 continue
@@ -188,20 +175,25 @@ class C2Server:
                 logger.info("Server stopped")
 
     async def stop(self):
-        """Optional helper to shut down programmatically from elsewhere."""
-        self.shutdown.set()
-        if self._server:
-            await self.close_writers()
-            logger.info("Server closing...")
-            self._server.close()
-            await self._server.wait_closed()
+        if not self._server:
+            logger.info("Server not running, for some reason")
+            return
+        # Stop accepting new connections first
+        logger.info("Server closing...")
+        self._server.close()
+        # Then close existing clients
+        await self.close_writers()
+        await self._server.wait_closed()
 
     async def close_writers(self) -> None:
         """Close all client writers"""
-        for client_id, state in self.clients.items():
-            if state.writer and not state.writer.is_closing():
-                state.writer.close()
-                await state.writer.wait_closed()
+        for client_id, client_state in self.clients.items():
+            if client_state.writer and not client_state.writer.is_closing():
+                client_state.writer.close()
+                try:
+                    await asyncio.wait_for(client_state.writer.wait_closed(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    logger.info(f"Timeout waiting for writer to close reached for {client_id}")
                 logger.info(f"Closed writer for {client_id}")
         self.clients.clear()
     
@@ -239,12 +231,12 @@ class C2Server:
         if client_id not in self.clients:
             logger.info(f"Client {client_id} not found")
             return
-        client_status = self.clients[client_id].status
-        if client_status == "killed":
+        client = self.clients[client_id]
+        if client.is_killed:
             logger.info(f"Client {client_id} was killed - not connected")
             return
-        elif client_status != "connected":
-            logger.info(f"Client {client_id} not in connected state ({client_status})")
+        elif not client.is_connected:
+            logger.info(f"Client {client_id} not in connected state ({client})")
             return
         
         # Queue command
@@ -271,7 +263,7 @@ class C2Server:
         })
         
         logger.info(f"Kill command sent to {client_id}")
-        client_state.status = "killed"
+        client_state.set_killed()
     
     async def admin_cli(self):
         """
