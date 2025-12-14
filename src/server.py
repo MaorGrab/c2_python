@@ -19,6 +19,7 @@ from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.client_state import ClientState
 from models.message_type import MessageType
+from models.connection_status import ConnectionStatus
 
 # ==================== CONFIGURATION ====================
 
