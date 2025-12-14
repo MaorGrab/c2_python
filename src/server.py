@@ -86,29 +86,7 @@ class C2Server:
             
         except Exception as e:
             logger.error(f"Client handler error: {e}")
-        finally:
-            await self._cleanup_client(client_id, client_state)
 
-    async def _cleanup_client(self, client_id, client_state):
-        try:
-            logger.info(f"Client disconnected: {client_id}")
-            # # Cancel tasks that reference this state (store task refs when created)
-            # for t in client_state.tasks:
-            #     t.cancel()
-            # await asyncio.gather(*client_state.tasks, return_exceptions=True)
-        except Exception as e:
-            logger.exception(f"Error cleaning up client: {e}")
-        finally:
-            try:
-                if client_state is None:
-                    return
-                client_state.writer.close()
-                await client_state.writer.wait_closed()
-            except Exception:
-                logger.exception("Error closing writer")
-            # self.clients.pop(client_id, None)
-
-    
     async def _client_loop(self, state: ClientState):
         """
         Main loop for client communication
@@ -213,8 +191,19 @@ class C2Server:
         """Optional helper to shut down programmatically from elsewhere."""
         self.shutdown.set()
         if self._server:
+            await self.close_writers()
+            logger.info("Server closing...")
             self._server.close()
             await self._server.wait_closed()
+
+    async def close_writers(self) -> None:
+        """Close all client writers"""
+        for client_id, state in self.clients.items():
+            if state.writer and not state.writer.is_closing():
+                state.writer.close()
+                await state.writer.wait_closed()
+                logger.info(f"Closed writer for {client_id}")
+        self.clients.clear()
     
     # ==================== ADMIN CLI (STEP 1) ====================
     

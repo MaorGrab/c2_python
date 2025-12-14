@@ -34,10 +34,10 @@ async def receive_message(reader) -> Message:
         payload = await reader.readexactly(length)
         return Message.from_payload(payload)
     except asyncio.IncompleteReadError:
-        logger.debug("Connection closed")
+        logger.info("Connection closed")
         return None
     except ConnectionResetError:
-        logger.debug("Connection reset by peer")
+        logger.info("Connection reset by peer")
         return None
     except Exception as e:
         logger.error(f"Failed to receive message: {e}")
