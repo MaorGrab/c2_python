@@ -11,18 +11,21 @@ class ClientState:
         self.writer = writer
         self.command_queue = asyncio.Queue()
         self.last_heartbeat = time.time()
-        self.status = ConnectionStatus.CONNECTING
+        self.status = ConnectionStatus.CONNECTED
         self.pending_results = {}  # {msg_id → result}
 
-    def set_connected(self) -> None:
-        self.status = ConnectionStatus.CONNECTED
-
+    def set_killing(self) -> None:
+        self.status = ConnectionStatus.KILLING
+    
     def set_killed(self) -> None:
         self.status = ConnectionStatus.KILLED
 
     @property
     def is_connected(self) -> bool:
-        return self.status is ConnectionStatus.CONNECTED
+        return self.status in (
+            ConnectionStatus.CONNECTED,
+            ConnectionStatus.KILLING
+        )
     
     @property
     def is_killed(self) -> bool:

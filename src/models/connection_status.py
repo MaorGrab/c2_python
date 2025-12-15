@@ -9,6 +9,7 @@ class ConnectionStatus(Enum):
     """C2 Client Connection Status"""
     CONNECTING = "connecting"
     CONNECTED = "connected"
+    KILLING = "killing"
     KILLED = "killed"
     
     def __str__(self) -> str:
