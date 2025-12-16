@@ -178,11 +178,7 @@ class C2Client:
 
                 # Connection closed
                 if not msg:
-                    if not self.running:
-                        logger.info("Client closed connection")
-                    else:
-                        logger.info("Server closed connection")
-                    self.shutdown_event.set()
+                    logger.warning(f"Received an empty message")
                     break
                 msg = self._encryption_manager.decrypt(msg)
                 
@@ -198,6 +194,9 @@ class C2Client:
         
         except asyncio.CancelledError:
             logger.info('command_listener cancelled')
+        except asyncio.IncompleteReadError:
+            logger.info(("Server" if self.running else "Client") + " closed connection")
+            self.shutdown_event.set()
         except Exception as e:
             logger.error(f"Command listener error: {e}")
     

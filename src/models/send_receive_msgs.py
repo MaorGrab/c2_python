@@ -1,6 +1,5 @@
 import logging 
 import asyncio
-from models.message import Message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -8,7 +7,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def send_message(writer, message) -> bool:
+async def send_message(writer, message: bytes) -> bool:
     """
     Send JSON message to client
     Format: length_prefix(4 bytes)
@@ -34,8 +33,7 @@ async def receive_message(reader) -> bytes:
         payload = await reader.readexactly(length)
         return payload
     except asyncio.IncompleteReadError:
-        logger.info("Connection closed")
-        return None
+        raise  # connection closed
     except ConnectionResetError:
         logger.info("Connection reset by peer")
         return None

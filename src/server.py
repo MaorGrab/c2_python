@@ -81,6 +81,8 @@ class C2Server:
             await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Client loop cancelled")
+        except Exception as e:
+            logger.error(f"Client loop error: {e}")
         finally:
             await self._cancel_tasks(tasks)
             
@@ -104,8 +106,10 @@ class C2Server:
                     break
                 msg = await receive_message(client_state.reader)
                 if not msg:
+                    logger.warning(f"Received an empty message")
                     break
                 if self.shutdown.is_set():
+                    logger.info('shutdown detected from receiver')
                     break
                 msg = self._encryption_manager.decrypt(msg)
                 if msg.type is MessageType.RESULT:
@@ -122,6 +126,8 @@ class C2Server:
             
         except asyncio.CancelledError:
             logger.info("Command receiver cancelled")
+        except asyncio.IncompleteReadError:
+            logger.info("Connection closed")
         except Exception as e:
             logger.error(f"Command receiver error: {e}")
     
@@ -136,6 +142,7 @@ class C2Server:
                     break
                 cmd_data = await client_state.command_queue.get()
                 if self.shutdown.is_set():
+                    logger.info('shutdown detected from executor')
                     break
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command")
@@ -298,6 +305,7 @@ class C2Server:
                 elif cmd_type is CommandType.EXIT:
                     logger.info('Exiting server')
                     self.shutdown.set()
+                    break
                 
                 elif cmd_type is CommandType.RUN:
                     self.cmd_run(cmd_parts[1].strip())
