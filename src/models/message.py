@@ -26,8 +26,10 @@ class Message:
         data = {k: v for k, v in class_dict.items() if v is not None}
         return json.dumps(data)
 
-    def to_payload(self) -> bytes:
+    def to_payload(self, with_prefix: bool = False) -> bytes:
         message = self.to_json().encode()
+        if not with_prefix:
+            return message
         prefix = len(message).to_bytes(4, 'big')
         return prefix + message
     
@@ -50,9 +52,9 @@ class Message:
         return cls(type=MessageType.REGISTER, client_id=client_id)
     
     @classmethod
-    def as_ack(cls, client_id: str) -> 'Message':
+    def as_ack(cls, client_id: str, master_key: bytes) -> 'Message':
         """Create acknowledgment message"""
-        return cls(type=MessageType.ACK, client_id=client_id)
+        return cls(type=MessageType.ACK, client_id=client_id, command=master_key)
     
     @classmethod
     def as_command(cls, cmd_id: str, command: str) -> 'Message':

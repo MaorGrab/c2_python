@@ -28,5 +28,9 @@ class ClientState:
         )
     
     @property
+    def is_killing(self) -> bool:
+        return self.status is ConnectionStatus.KILLING
+    
+    @property
     def is_killed(self) -> bool:
         return self.status is ConnectionStatus.KILLED

