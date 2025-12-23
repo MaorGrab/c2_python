@@ -21,7 +21,6 @@ from models.send_receive_msgs import send_message, receive_message
 from models.client_manager import ClientManager
 from models.message_type import MessageType
 from models.command_type import CommandType
-from models.encryption_manager import EncryptionManager
 from models.tls_helper import TLSSessionHelper
 
 # ==================== CONFIGURATION ====================
@@ -42,8 +41,7 @@ class C2Server:
         self.port = port
         self.shutdown = asyncio.Event()
         self._server: asyncio.base_events.Server | None = None
-        self._encryption_manager = EncryptionManager()
-        self.client_manager = ClientManager(self._encryption_manager)
+        self.client_manager = ClientManager()
         self.client_manager.set_shutdown_event(self.shutdown)
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

