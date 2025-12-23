@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict
+from typing import Dict, Optional
 import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -14,9 +14,11 @@ from models.message import Message
 
 class EncryptionManager:
     """Handles AES-256-GCM encryption for STEP 2"""
+    # TODO: check if master key was assigned
+    # TODO: make the session key generation more general and with better function names
     
-    def __init__(self):
-        self.session_key = None
+    def __init__(self, master_key: bytes = None):
+        self.session_key: Optional[bytes] = master_key
         self.private_key = x25519.X25519PrivateKey.generate()
 
     @property
