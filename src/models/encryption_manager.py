@@ -1,8 +1,13 @@
 import os
 import json
 from typing import Dict
+import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
 
 from models.message import Message
 
@@ -10,16 +15,59 @@ from models.message import Message
 class EncryptionManager:
     """Handles AES-256-GCM encryption for STEP 2"""
     
-    def __init__(self, master_key: bytes):
-        """master_key: 32 bytes for AES-256"""
-        assert len(master_key) == 32, "Master key must be 32 bytes (AES-256)"
-        self.master_key = master_key
+    def __init__(self):
+        self.session_key = None
+        self.private_key = x25519.X25519PrivateKey.generate()
+
+    @property
+    def public_key(self) -> bytes:
+        """Get the public key of the encryption manager"""
+        return self.private_key.public_key()
+    
+    @property
+    def _serialized_public_key_bytes(self) -> bytes:
+        """Get the serialized public key of the encryption manager"""
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    
+    @property
+    def serialized_public_key(self) -> str:
+        """Get the serialized public key of the encryption manager as a string"""
+        return base64.b64encode(self._serialized_public_key_bytes).decode('ascii')
+    
+    @staticmethod
+    def _load_public_key(serialized_public_key: str) -> bytes:
+        """Load a public key from a string"""
+        return base64.b64decode(serialized_public_key)
+    
+    def compute_session_key(self, peer_public_key: str) -> None:
+        """Compute the shared secret and derive the session key"""
+        peer_public_key_bytes = self._load_public_key(peer_public_key)
+        shared_secret = self._compute_shared_secret(peer_public_key_bytes)
+        self._derive_session_key(shared_secret)
+
+    def _compute_shared_secret(self, peer_public_key: bytes) -> bytes:
+        """Compute the ECDH shared secret using the peer's public key."""
+        peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_key)
+        return self.private_key.exchange(peer_public_key)
+
+    def _derive_session_key(self, shared_secret: bytes) -> None:
+        """Derive a symmetric session key from the ECDH shared secret using HKDF."""
+        self.session_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"payload-encryption-key",
+            backend=default_backend()
+        ).derive(shared_secret)
     
     def encrypt(self, message: Message, aad: str = None) -> bytes:
         """Encrypt message with AES-256-GCM"""
         iv = os.urandom(12)
         cipher = Cipher(
-            algorithms.AES(self.master_key),
+            algorithms.AES(self.session_key),
             modes.GCM(iv),
             backend=default_backend()
         )
@@ -47,7 +95,7 @@ class EncryptionManager:
             tag = bytes.fromhex(aes_dict["tag"])
             
             cipher = Cipher(
-                algorithms.AES(self.master_key),
+                algorithms.AES(self.session_key),
                 modes.GCM(iv, tag),
                 backend=default_backend()
             )
@@ -59,5 +107,5 @@ class EncryptionManager:
             msg = decryptor.update(data) + decryptor.finalize()
             return Message.from_payload(msg)
         except Exception as e:
-            # logger.error(f"Decryption failed: {e}")
+            print(f"Decryption failed: {e}")
             return None
