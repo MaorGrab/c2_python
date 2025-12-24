@@ -11,6 +11,7 @@ class ConnectionStatus(Enum):
     CONNECTED = "connected"
     KILLING = "killing"
     KILLED = "killed"
+    DISCONNECTED = "disconnected"
     
     def __str__(self) -> str:
         return self.value

@@ -47,6 +47,9 @@ class ClientState:
     def set_killed(self) -> None:
         self.status = ConnectionStatus.KILLED
 
+    def set_disconnected(self) -> None:
+        self.status = ConnectionStatus.DISCONNECTED
+
     @property
     def is_connected(self) -> bool:
         return self.status in (
@@ -61,3 +64,10 @@ class ClientState:
     @property
     def is_killed(self) -> bool:
         return self.status is ConnectionStatus.KILLED
+    
+    @property
+    def is_disconnected(self) -> bool:
+        return self.status in (
+            ConnectionStatus.DISCONNECTED,
+            ConnectionStatus.KILLED,
+        )

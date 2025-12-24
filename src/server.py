@@ -96,11 +96,9 @@ class C2Server:
         if not self._server:
             logger.info("Server not running, for some reason")
             return
-        # Stop accepting new connections first
         logger.info("Server closing...")
-        self._server.close()
-        # Then close existing clients
         await self.client_manager.close_all_clients()
+        self._server.close()
         await self._server.wait_closed()
 
 
@@ -156,6 +154,7 @@ class C2Server:
             while not self.shutdown.is_set():
                 if self.shutdown.is_set():
                     break
+                await asyncio.sleep(0.5)  # solves ">" being printed into log stream (most times)
                 cmd = await asyncio.to_thread(input, "> ")
                 if not cmd:
                     continue

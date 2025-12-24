@@ -261,6 +261,7 @@ class C2Client:
             logger.error(f"Command listener error: {e}")
 
     def _drain_queue(self):
+        # TODO: make global helper function
         try:
             while not self.command_queue.empty():
                 cmd_data = self.command_queue.get_nowait()
@@ -359,7 +360,7 @@ class C2Client:
             
             # Combine stdout and stderr
             stdout, stderr = await self.execution_process.communicate()
-            # self.execution_process = None
+            self.execution_process = None
             output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
             return output if output else "[No output]"
         except asyncio.CancelledError:
