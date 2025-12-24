@@ -151,14 +151,12 @@ class C2Server:
         """
         Admin CLI loop
         Runs in separate thread/coroutine
-        """
-        loop = asyncio.get_event_loop()
-        
+        """        
         try:
             while not self.shutdown.is_set():
                 if self.shutdown.is_set():
                     break
-                cmd = await loop.run_in_executor(None, input, "> ")
+                cmd = await asyncio.to_thread(input, "> ")
                 if not cmd:
                     continue
                 cmd_parts = cmd.lower().split(maxsplit=1)

