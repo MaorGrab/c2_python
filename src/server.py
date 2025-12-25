@@ -27,7 +27,7 @@ from models.tls_helper import TLSSessionHelper
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(name)s|%(funcName)s:%(lineno)d] %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,6 @@ class C2Server:
         self.shutdown = asyncio.Event()
         self._server: asyncio.base_events.Server | None = None
         self.client_manager = ClientManager()
-        self.client_manager.set_shutdown_event(self.shutdown)
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
