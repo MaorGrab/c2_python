@@ -109,7 +109,7 @@ class ClientState:
         
         except asyncio.CancelledError:
             logger.info(f"[{self.client_id}] Message receiver cancelled")
-        except asyncio.IncompleteReadError:
+        except (asyncio.IncompleteReadError, ConnectionResetError):
             self._handle_disconnection()
         except Exception as e:
             logger.error(f"[{self.client_id}] Message receiver error: {e}")
@@ -120,7 +120,7 @@ class ClientState:
             while self.is_connected:
                 cmd_data = await self.command_queue.get()
                 if cmd_data is None:
-                    logger.info(f'[{self.client_id}] Received empty command from queue')
+                    logger.info(f'[{self.client_id}] Received None from queue')
                     continue
                 await self._execute_command(cmd_data)
             else:
@@ -152,7 +152,7 @@ class ClientState:
     
     def _handle_disconnection(self):
         """Handle client disconnection"""
-        prefix = '[{self.client_id}] Connection closed'
+        prefix = f'[{self.client_id}] Connection closed'
         if self.is_killed:
             logger.info(f"{prefix} - Client killed")
         elif self.is_connected:

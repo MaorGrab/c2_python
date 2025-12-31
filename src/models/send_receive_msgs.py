@@ -32,7 +32,7 @@ async def receive_message(reader) -> bytes:
         raise  # connection closed
     except ConnectionResetError:
         logger.info("Connection reset by peer")
-        return None
+        raise
     except Exception as e:
         logger.error(f"Failed to receive message: {e}")
         return None
