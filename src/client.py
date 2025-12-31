@@ -373,16 +373,19 @@ class C2Client:
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
-        logger.info("Terminating execution process")
         if not self.execution_process:
             return
         try:
+            logger.info(f"Terminating execution process {self.execution_process.pid}")
             await self._terminate_subprocess_gracefully(self.execution_process)
+            self.execution_process = None
         except asyncio.TimeoutError:
             logger.error("Terminating process timed out")
         except Exception as e:
             logger.error(f"Error terminating process: {e}")
         finally:
+            if not self.execution_process:
+                return
             await self._terminate_subprocess_forcefully(self.execution_process)
 
     @staticmethod
