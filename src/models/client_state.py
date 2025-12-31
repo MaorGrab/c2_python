@@ -60,8 +60,10 @@ class ClientState:
     def kill(self) -> bool:
         """Send kill command to client"""
         try:
+            self.pending_results.clear()
+            self._cleanup_queue()
             self.add_command(CommandType.KILL.value)
-            self.set_killing()
+            self.set_killed()
             return True
         except Exception:
             return False
@@ -86,11 +88,7 @@ class ClientState:
     async def _message_receiver(self):
         """Receive and process messages from client"""
         try:
-            while True:
-                if self.is_killed or self.is_disconnected:
-                    logger.info(f'[{self.client_id}] Receiver stopped | client killed/disconnected')
-                    break
-                
+            while self.is_connected:
                 msg = await receive_message(self.reader)
                 if not msg:
                     logger.warning(f"[{self.client_id}] Empty message received")
@@ -101,43 +99,32 @@ class ClientState:
                     logger.warning(f"[{self.client_id}] Failed to decrypt message")
                     break
                 
-                if msg.type is MessageType.RESULT:
-                    await self._handle_result(msg)
-                else:
+                if msg.type is not MessageType.RESULT:
                     logger.warning(f"[{self.client_id}] Unknown message type: {msg.type}")
+                    continue
+                
+                await self._handle_result(msg)
+            else:
+                logger.info(f'[{self.client_id}] Receiver exiting | client not connected')
         
         except asyncio.CancelledError:
             logger.info(f"[{self.client_id}] Message receiver cancelled")
         except asyncio.IncompleteReadError:
-            logger.info(f"[{self.client_id}] Connection closed")
             self._handle_disconnection()
         except Exception as e:
             logger.error(f"[{self.client_id}] Message receiver error: {e}")
-        finally:
-            logger.info(f"[{self.client_id}] Message receiver finished")
-            self._cleanup_queue()
-            self.pending_results.clear()
-            self.command_queue.put_nowait(None)  # unblock command executor
     
     async def _command_executor(self):
         """Execute commands from queue"""
         try:
-            while True:
-                if not self.is_connected:
-                    logger.info(f'[{self.client_id}] Executor stopped | client not connected')
-                    break
-                
+            while self.is_connected:
                 cmd_data = await self.command_queue.get()
                 if cmd_data is None:
                     logger.info(f'[{self.client_id}] Received empty command from queue')
                     continue
-                try:
-                    await self._execute_command(cmd_data)
-                except Exception as e:
-                    if str(e) == "KILL_KILL":
-                        logger.info(f"[{self.client_id}] Executor stopped | caught kill")
-                        break
-                    logger.info(f"[{self.client_id}] Command execution error: {e}")
+                await self._execute_command(cmd_data)
+            else:
+                logger.info(f'[{self.client_id}] Executor exiting | client not connected')
         
         except asyncio.CancelledError:
             logger.info(f"[{self.client_id}] Command executor cancelled")
@@ -147,19 +134,13 @@ class ClientState:
     async def _handle_result(self, msg: Message):
         """Handle result message from client"""
         logger.info(f"[{self.client_id}] Result: {msg.result}")
-        
         if msg.cmd_id in self.pending_results:
             del self.pending_results[msg.cmd_id]
-            
-            if self.is_killing:
-                logger.info(f"[{self.client_id}] Didn't wait for {len(self.pending_results)} results")
-                self.set_killed()
     
     async def _execute_command(self, cmd_data: dict):
         """Execute a single command"""
         cmd_id = cmd_data.get("cmd_id")
         command = cmd_data.get("command")
-        
         logger.info(f"[{self.client_id}] Executing: {command}")
 
         self.pending_results[cmd_id] = command
@@ -168,18 +149,19 @@ class ClientState:
         
         await send_message(self.writer, encrypted_msg)
         logger.info(f"[{self.client_id}] Command sent: {command}")
-        if command == CommandType.KILL.value:
-            self._cleanup_queue()
-            raise Exception("KILL_KILL")
     
     def _handle_disconnection(self):
         """Handle client disconnection"""
-        if self.is_connected:
+        prefix = '[{self.client_id}] Connection closed'
+        if self.is_killed:
+            logger.info(f"{prefix} - Client killed")
+        elif self.is_connected:
             self.set_disconnected()
-            logger.info(f"[{self.client_id}] Client disconnected")
+            self._cleanup_queue()
+            self.command_queue.put_nowait(None)  # TODO: add sentinel
+            logger.info(f"{prefix} - Client disconnected")
         else:
-            self.set_killed()
-            logger.info(f"[{self.client_id}] Client killed")
+            logger.warning(f"{prefix} - Client already disconnected")
     
     def _cleanup_queue(self):
         """Clean up command queues"""
@@ -195,7 +177,6 @@ class ClientState:
         """Clean up network connection"""
         if not self.writer or self.writer.is_closing():
             return
-        
         try:
             if self.reader:
                 self.reader.feed_eof()
@@ -221,9 +202,6 @@ class ClientState:
                 logger.info(f"[{self.client_id}] Cancelling task: {task.get_name()}")
                 task.cancel()
         logger.info(f"[{self.client_id}] Tasks cancelled")
-
-    def set_killing(self) -> None:
-        self.status = ConnectionStatus.KILLING
     
     def set_killed(self) -> None:
         self.status = ConnectionStatus.KILLED
@@ -233,14 +211,7 @@ class ClientState:
 
     @property
     def is_connected(self) -> bool:
-        return self.status in (
-            ConnectionStatus.CONNECTED,
-            ConnectionStatus.KILLING
-        )
-    
-    @property
-    def is_killing(self) -> bool:
-        return self.status is ConnectionStatus.KILLING
+        return self.status is ConnectionStatus.CONNECTED
     
     @property
     def is_killed(self) -> bool:
