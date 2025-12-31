@@ -32,7 +32,7 @@ from models.tls_helper import TLSSessionHelper
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(name)s|%(funcName)s:%(lineno)d] %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,7 @@ class C2Client:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Client main loop cancelled")
+            self.running = False
         finally:
             logger.info("Client canceling tasks")
             await self._cancel_tasks(tasks)
