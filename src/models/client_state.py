@@ -4,7 +4,6 @@ import uuid
 import logging
 from typing import Optional
 from .connection_status import ConnectionStatus
-from .key_manager import KeyManager
 from .encryption_manager import EncryptionManager
 from .message import Message
 from .message_type import MessageType
@@ -27,14 +26,12 @@ class ClientState:
         self.pending_results = {}  # {msg_id → result}
         
         # Client-specific encryption management
-        self.key_manager = KeyManager()
-        self._encryption_manager: Optional[EncryptionManager] = None
+        self._encryption_manager = EncryptionManager()
     
     def setup_encryption(self, peer_public_key: str) -> str:
         """Setup encryption with peer's public key, returns our public key"""
-        session_key = self.key_manager.compute_session_key(peer_public_key)
-        self._encryption_manager = EncryptionManager(session_key)
-        return self.key_manager.serialized_public_key
+        self._encryption_manager.establish_session_key(peer_public_key)
+        return self._encryption_manager.public_key_b64
     
     def encrypt_message(self, message: Message) -> bytes:
         """Encrypt message for this client"""

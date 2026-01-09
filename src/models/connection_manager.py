@@ -3,6 +3,7 @@ import logging
 import asyncio
 
 from models.tls_helper import TLSSessionHelper
+from helper.auth import validate_server_certificate
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class ConnectionManager:
         
     async def _open_connection(self) -> bool:
         """
-        Connect to C2 server and register
+        Connect to C2 server with certificate validation
         """
         try:
             ssl_ctx = TLSSessionHelper().create_context(
@@ -39,6 +40,13 @@ class ConnectionManager:
                 self.server_port,
                 ssl=ssl_ctx,
             )
+            
+            # Validate server certificate before marking as connected
+            if not validate_server_certificate(self.writer):
+                logger.error("Server certificate validation failed")
+                await self._clear_connection()
+                return False
+            
             self._connected_event.set()
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
             return True

@@ -15,34 +15,52 @@ logger = logging.getLogger(__name__)
 class CommunicationManager:
     """Handles message-level I/O, encryption, and queue management"""
     
-    def __init__(self, connection_manager: ConnectionManager):
-        self.connection_manager = connection_manager
+    def __init__(self, server_host: str, server_port: int, client_id: str):
+        self.client_id = client_id
+        self.connection_manager = ConnectionManager(server_host, server_port, client_id)
         self.encryption_manager = None
         self.command_queue = asyncio.Queue()
         self.result_queue = asyncio.Queue()
         self._active_event = asyncio.Event()
         self._listener_task = None
         self._talker_task = None
-        self._should_stop = False
 
     @property
     def is_active(self):
         """Check if communication is active"""
-        return self._active_event.is_set() and not self._should_stop
+        return self._active_event.is_set()
     
     async def wait_active(self):
         """Wait until communication is active"""
         await self._active_event.wait()
 
     async def start_communication(self):
-        """Start listener and talker tasks"""
-        if self._should_stop:
-            logger.info("Communication manager stopped, cannot start")
-            return
-        
-        # Wait for connection to be ready
-        await self.connection_manager.wait_connected()
+        """Start communication with automatic connection management"""
+        try:
+            # Start connection manager
+            await self.connection_manager.start()
             
+            while True:
+                # Wait for connection
+                await self.connection_manager.wait_connected()
+                
+                # Perform handshake
+                if not await self._perform_handshake():
+                    logger.error("Handshake failed, will retry")
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Start listener and talker
+                await self._start_message_loop()
+                
+        except asyncio.CancelledError:
+            logger.info("Communication cancelled")
+            raise
+        finally:
+            await self.connection_manager.close()
+    
+    async def _start_message_loop(self):
+        """Start listener and talker tasks"""
         self._listener_task = asyncio.create_task(self._listener(), name='listener')
         self._talker_task = asyncio.create_task(self._talker(), name='talker')
         self._active_event.set()
@@ -50,16 +68,15 @@ class CommunicationManager:
         try:
             await self._listener_task
         except asyncio.CancelledError:
-            logger.info("Communication detected cancellation")
+            logger.info("Message loop cancelled")
             raise
         except asyncio.IncompleteReadError:
-            logger.info("Communication detected server closed connection")
-            raise
+            logger.info("Server closed connection")
         except Exception as e:
-            logger.error(f"Communication error: {e}")
-            raise
+            logger.error(f"Message loop error: {e}")
         finally:
             await self._cleanup_tasks()
+            await self.connection_manager._clear_connection()
 
     async def _cleanup_tasks(self):
         """Cleanup tasks and go dormant"""
@@ -70,7 +87,7 @@ class CommunicationManager:
     async def _listener(self):
         """Listen for incoming commands from server"""
         try:
-            while not self._should_stop:
+            while True:
                 encrypted_message = await receive_message(self.connection_manager.reader)
                 if not encrypted_message:
                     logger.warning("Received empty message")
@@ -88,16 +105,13 @@ class CommunicationManager:
                 logger.info(f"Received command: {msg.command}, id: {msg.cmd_id}")
                 
                 if msg.command == CommandType.KILL.value:
-                    if await self._handle_kill_command():
-                        break
-                    continue
+                    await self._handle_kill_command()
+                    break
                     
                 await self.command_queue.put({
                     "cmd_id": msg.cmd_id,
                     "command": msg.command
                 })
-            else:
-                logger.info("Listener exiting | stopped")
         
         except asyncio.CancelledError:
             logger.info('Listener cancelled')
@@ -114,7 +128,7 @@ class CommunicationManager:
     async def _talker(self):
         """Send results back to server"""
         try:
-            while not self._should_stop:
+            while True:
                 result_data = await self.result_queue.get()
                 command_id, result, execution_time_ms = result_data
                 
@@ -125,8 +139,6 @@ class CommunicationManager:
                     logger.info(f"[cmd id: {command_id}] Result sent ({execution_time_ms:.1f}ms)")
                 else:
                     logger.warning(f"[cmd id: {command_id}] Failed to send result")
-            else:
-                logger.info("Talker exiting | stopped")
                 
         except asyncio.CancelledError:
             logger.info("Talker cancelled")
@@ -144,7 +156,7 @@ class CommunicationManager:
         helper_funcs.drain_queue(self.command_queue)
         logger.info('Draining result queue')
         helper_funcs.drain_queue(self.result_queue)
-        return True
+        self.connection_manager.close()
 
     async def send_result(self, cmd_id: str, result: str, exec_time_ms: float):
         """Enqueue result for sending"""
@@ -160,19 +172,16 @@ class CommunicationManager:
         except asyncio.CancelledError:
             return None
 
-    def stop(self):
-        """Stop communication permanently"""
-        self._should_stop = True
-        self._active_event.clear()
 
-    async def perform_handshake(self, client_id: str) -> bool:
+
+    async def _perform_handshake(self) -> bool:
         """Perform registration and encryption setup"""
         try:
             # Create encryption manager with key exchange
             self.encryption_manager = EncryptionManager()
             
             # Send registration with our public key
-            msg = Message.as_register(client_id, self.encryption_manager.public_key_b64)
+            msg = Message.as_register(self.client_id, self.encryption_manager.public_key_b64)
             if not await send_message(self.connection_manager.writer, msg.to_payload(True)):
                 logger.error("Failed to send registration")
                 return False
