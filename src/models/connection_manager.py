@@ -4,6 +4,7 @@ import asyncio
 
 from models.tls_helper import TLSSessionHelper
 from helper.auth import validate_server_certificate
+from helper.helper_funcs import cancel_task
 
 logger = logging.getLogger(__name__)
 
@@ -15,17 +16,20 @@ class ConnectionManager:
         self.client_id = client_id
         self.reader = None
         self.writer = None
-        self._connected_event = asyncio.Event()
+        self._connected = asyncio.Event()
+        self._reconnect = asyncio.Event()
         self._reconnection_task = None
-        self._should_stop = False
     
     @property
-    def is_connected(self):
-        return self.reader is not None and self.writer is not None
+    def is_active(self):
+        return self._reconnection_task is not None
     
     async def wait_connected(self):
         """Wait until connection is established"""
-        await self._connected_event.wait()
+        if not self.is_active:
+            return False
+        await self._connected.wait()
+        return True
         
     async def _open_connection(self) -> bool:
         """
@@ -44,14 +48,12 @@ class ConnectionManager:
             # Validate server certificate before marking as connected
             if not validate_server_certificate(self.writer):
                 logger.error("Server certificate validation failed")
-                await self._clear_connection()
                 return False
             
-            self._connected_event.set()
             logger.info(f"Connected to server at {self.server_host}:{self.server_port}")
             return True
         except ConnectionRefusedError:
-            logger.error("Connection refused, server possibly down")
+            logger.info("Connection refused, server possibly down")
             return False
         except asyncio.CancelledError:
             logger.info("Connection attempt cancelled")
@@ -60,8 +62,7 @@ class ConnectionManager:
             logger.error(f"Connection failed: {e}")
             return False
     
-    async def _clear_connection(self):
-        self._connected_event.clear()
+    async def _reset_streams(self):
         try:
             if self.writer and not self.writer.is_closing():
                 self.writer.close()
@@ -73,6 +74,26 @@ class ConnectionManager:
             self.reader = None
             self.writer = None
 
+    async def trigger_reconnection(self):
+        if not self.is_active:
+            return
+        self._set_events_reconnect()
+        await self._reset_streams()
+
+    def _set_events_reconnect(self):
+        """
+        Set reconnection events to allow reconnection loop to run
+        """
+        self._connected.clear()
+        self._reconnect.set()
+
+    def _set_events_connected(self):
+        """
+        Set events to indicate connection is established
+        """
+        self._connected.set()
+        self._reconnect.clear()
+
     async def _reconnection_loop(self):
         """
         Background reconnection loop - runs continuously
@@ -80,17 +101,16 @@ class ConnectionManager:
         try:
             reconnect_delay = 1
             
-            while not self._should_stop:
-                if not self.is_connected:
-                    logger.info("Connection lost, attempting to reconnect...")
-                    await self._clear_connection()
-                    
-                    if await self._open_connection():
-                        logger.info("Reconnection successful")
-                    else:
-                        await asyncio.sleep(reconnect_delay)
+            while True:
+                await self._reconnect.wait()
+                logger.info(f"attempting to reconnect...")
+                await self._reset_streams()
+                
+                if await self._open_connection():
+                    logger.info("Reconnection successful")
+                    self._set_events_connected()
                 else:
-                    await asyncio.sleep(1)  # Check connection status periodically
+                    await asyncio.sleep(reconnect_delay)
                     
         except asyncio.CancelledError:
             logger.info("Reconnection loop cancelled")
@@ -99,27 +119,21 @@ class ConnectionManager:
             logger.error(f"Reconnection loop error: {e}")
             raise
         finally:
-            await self._clear_connection()
+            await self._reset_streams()
 
     async def start(self):
         """Start connection manager with background reconnection"""
-        if self._reconnection_task:
+        if self.is_active:
             logger.warning("Connection manager already started")
             return
-        
+        self._set_events_reconnect()
+        if await self._open_connection():
+            self._set_events_connected()
         self._reconnection_task = asyncio.create_task(self._reconnection_loop(), name='reconnection')
         await self.wait_connected()  # Wait for initial connection
 
-    async def close(self):
-        self._should_stop = True
-        if self._reconnection_task:
-            self._reconnection_task.cancel()
-            try:
-                await self._reconnection_task
-            except asyncio.CancelledError:
-                pass
-        await self._clear_connection()
-
-    @property
-    def is_connected(self):
-        return self.reader is not None and self.writer is not None
+    async def shutdown(self):
+        if not self.is_active:
+            logger.warning("Trying to shutdown non-active connection manager")
+        await cancel_task(self._reconnection_task)
+        self._reconnection_task = None

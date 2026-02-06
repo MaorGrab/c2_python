@@ -19,10 +19,10 @@ class CommandExecutor:
         """Start executor loop"""
         try:
             while not self._should_stop:
-                
                 # Receive command
                 command_data = await in_qeueue.get()
                 if command_data is None:
+                    logger.warning("Received None command")
                     continue
                 cmd_id = command_data.get("cmd_id")
                 command = command_data.get("command", "").lower()
@@ -48,6 +48,7 @@ class CommandExecutor:
         start_time = time.monotonic()
         
         if command == CommandType.KILL.value:
+            logger.info('KILL command received')
             result = "Client killed by server"
             await self._terminate_execution_process()
             self._should_stop = True
