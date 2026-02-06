@@ -134,6 +134,6 @@ class ConnectionManager:
 
     async def shutdown(self):
         if not self.is_active:
-            logger.warning("Trying to shutdown non-active connection manager")
+            return
         await cancel_task(self._reconnection_task)
         self._reconnection_task = None

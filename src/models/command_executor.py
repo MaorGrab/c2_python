@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import time
-from models.command_type import CommandType
-from models.communication_manager import CommunicationManager
 import helper.subprocess as subprocess_helper
 
 logger = logging.getLogger(__name__)
@@ -46,15 +44,7 @@ class CommandExecutor:
         """Process a single command"""
         cmd_id, command = command_data
         start_time = time.monotonic()
-        
-        if command == CommandType.KILL.value:
-            logger.info('KILL command received')
-            result = "Client killed by server"
-            await self._terminate_execution_process()
-            self._should_stop = True
-        else:
-            result = await self._execute_command(cmd_id, command)
-        
+        result = await self._execute_command(cmd_id, command)
         exec_time_ms = (time.monotonic() - start_time) * 1000
         logger.info(f"Executed: {command} ({exec_time_ms:.1f}ms)")
         return cmd_id, result, exec_time_ms
