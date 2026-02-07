@@ -1,0 +1,21 @@
+# Pre-commit configuration for C2 project
+# Uses pre-commit framework: https://pre-commit.com/
+#
+# Installation:
+#   pip install pre-commit
+#   pre-commit install --hook-type pre-push
+#
+# This runs unit tests before git push (not commit)
+
+repos:
+  - repo: local
+    hooks:
+      - id: run-unit-tests
+        name: Run Unit Tests
+        entry: python -m unittest discover -s tests/unit -p "test_*.py"
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push] # <--- CRITICAL: Defines this as a push hook only
+        verbose: true      # <--- Ensures you see the test output (Ok/Fail)

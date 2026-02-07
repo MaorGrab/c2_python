@@ -42,7 +42,7 @@ class TestClientManager(unittest.TestCase):
     
     def test_get_client_found(self):
         """Test getting existing client"""
-        mock_reader = AsyncMock()
+        mock_reader = Mock()  # Changed from AsyncMock
         mock_writer = Mock()
         client_state = ClientState("test-client", mock_reader, mock_writer)
         
@@ -60,7 +60,7 @@ class TestClientManager(unittest.TestCase):
     
     def test_list_clients_returns_copy(self):
         """Test that list_clients returns a copy"""
-        mock_reader = AsyncMock()
+        mock_reader = Mock()  # Changed from AsyncMock
         mock_writer = Mock()
         client_state = ClientState("test-client", mock_reader, mock_writer)
         
@@ -80,7 +80,7 @@ class TestClientManager(unittest.TestCase):
     
     def test_add_command_to_queue_success(self):
         """Test adding command to existing client"""
-        mock_reader = AsyncMock()
+        mock_reader = Mock()  # Changed from AsyncMock
         mock_writer = Mock()
         client_state = ClientState("test-client", mock_reader, mock_writer)
         
@@ -99,7 +99,7 @@ class TestClientManager(unittest.TestCase):
     
     def test_kill_client_success(self):
         """Test killing existing client"""
-        mock_reader = AsyncMock()
+        mock_reader = Mock()  # Changed from AsyncMock
         mock_writer = Mock()
         client_state = ClientState("test-client", mock_reader, mock_writer)
         
@@ -186,7 +186,8 @@ class TestClientManagerAsync(unittest.IsolatedAsyncioTestCase):
     
     async def test_close_all_clients(self):
         """Test closing all client connections"""
-        mock_reader1 = AsyncMock()
+        mock_reader1 = Mock()  # Changed from AsyncMock
+        mock_reader1.feed_eof = Mock()
         mock_writer1 = Mock()
         mock_writer1.is_closing = Mock(return_value=False)
         mock_writer1.close = Mock()

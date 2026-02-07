@@ -24,7 +24,8 @@ class TestClientState(unittest.TestCase):
     
     def setUp(self):
         """Setup mock reader/writer for each test"""
-        self.mock_reader = AsyncMock()
+        self.mock_reader = Mock()  # Changed from AsyncMock
+        self.mock_reader.feed_eof = Mock()  # Explicitly mock as sync
         self.mock_writer = Mock()
         self.mock_writer.is_closing = Mock(return_value=False)
         self.mock_writer.close = Mock()
@@ -123,7 +124,8 @@ class TestClientStateAsync(unittest.IsolatedAsyncioTestCase):
     
     async def asyncSetUp(self):
         """Setup mock reader/writer for async tests"""
-        self.mock_reader = AsyncMock()
+        self.mock_reader = Mock()  # Changed from AsyncMock
+        self.mock_reader.feed_eof = Mock()  # Explicitly mock as sync
         self.mock_writer = Mock()
         self.mock_writer.is_closing = Mock(return_value=False)
         self.mock_writer.close = Mock()
