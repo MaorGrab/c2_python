@@ -6,6 +6,8 @@ import sys
 import asyncio
 from pathlib import Path
 import pytest
+import pytest_asyncio
+from unittest.mock import Mock, AsyncMock
 
 # Add src directory to Python path for imports
 src_path = Path(__file__).parent.parent / 'src'
@@ -43,13 +45,53 @@ def key_manager_pair():
     return km1, km2
 
 
-@pytest.fixture
-async def command_executor():
-    """Provide CommandExecutor instance"""
+@pytest_asyncio.fixture
+async def executor():
+    """Provide CommandExecutor instance with cleanup"""
     from models.command_executor import CommandExecutor
-    executor = CommandExecutor()
-    yield executor
-    executor.stop()
+    exec_instance = CommandExecutor()
+    yield exec_instance
+    exec_instance.stop()
+
+
+@pytest_asyncio.fixture
+async def queues():
+    """Provide input and output queues"""
+    return asyncio.Queue(), asyncio.Queue()
+
+
+@pytest.fixture
+def cm():
+    """Provide CommunicationManager instance"""
+    from models.communication_manager import CommunicationManager
+    return CommunicationManager("127.0.0.1", 5000, "test-client")
+
+
+@pytest.fixture
+def peer_em():
+    """Provide peer EncryptionManager for testing"""
+    from models.encryption_manager import EncryptionManager
+    return EncryptionManager()
+
+
+@pytest.fixture
+def connection_manager():
+    """Provide ConnectionManager instance"""
+    from models.connection_manager import ConnectionManager
+    return ConnectionManager("127.0.0.1", 5000, "test-client")
+
+
+@pytest.fixture
+def mock_reader_writer():
+    """Provide mock reader/writer pair for I/O boundary testing"""
+    mock_reader = AsyncMock()
+    mock_writer = Mock()
+    mock_writer.write = Mock()
+    mock_writer.drain = AsyncMock()
+    mock_writer.is_closing = Mock(return_value=False)
+    mock_writer.close = Mock()
+    mock_writer.wait_closed = AsyncMock()
+    return mock_reader, mock_writer
 
 
 @pytest.fixture

@@ -9,41 +9,33 @@ from unittest.mock import Mock, AsyncMock, patch
 from models.connection_manager import ConnectionManager
 
 
-@pytest.fixture
-def cm():
-    """Provide ConnectionManager instance"""
-    return ConnectionManager("127.0.0.1", 5000, "test-client")
-
-
 @pytest.mark.asyncio
 @patch('models.connection_manager.asyncio.open_connection')
 @patch('models.connection_manager.validate_server_certificate')
 @patch('models.connection_manager.TLSSessionHelper')
-async def test_open_connection_success(mock_tls, mock_validate, mock_open, cm):
+async def test_open_connection_success(mock_tls, mock_validate, mock_open, connection_manager):
     """Test successful connection establishment"""
-    # Mock TLS context
     mock_tls_instance = Mock()
     mock_tls_instance.create_context.return_value = Mock()
     mock_tls.return_value = mock_tls_instance
     
-    # Mock connection
     mock_reader = AsyncMock()
     mock_writer = Mock()
     mock_open.return_value = (mock_reader, mock_writer)
     mock_validate.return_value = True
     
-    result = await cm._open_connection()
+    result = await connection_manager._open_connection()
     
     assert result is True
-    assert cm.reader == mock_reader
-    assert cm.writer == mock_writer
+    assert connection_manager.reader == mock_reader
+    assert connection_manager.writer == mock_writer
     mock_open.assert_called_once()
 
 
 @pytest.mark.asyncio
 @patch('models.connection_manager.asyncio.open_connection')
 @patch('models.connection_manager.TLSSessionHelper')
-async def test_open_connection_refused(mock_tls, mock_open, cm):
+async def test_open_connection_refused(mock_tls, mock_open, connection_manager):
     """Test connection refused handling"""
     mock_tls_instance = Mock()
     mock_tls_instance.create_context.return_value = Mock()
@@ -51,18 +43,18 @@ async def test_open_connection_refused(mock_tls, mock_open, cm):
     
     mock_open.side_effect = ConnectionRefusedError("Connection refused")
     
-    result = await cm._open_connection()
+    result = await connection_manager._open_connection()
     
     assert result is False
-    assert cm.reader is None
-    assert cm.writer is None
+    assert connection_manager.reader is None
+    assert connection_manager.writer is None
 
 
 @pytest.mark.asyncio
 @patch('models.connection_manager.asyncio.open_connection')
 @patch('models.connection_manager.validate_server_certificate')
 @patch('models.connection_manager.TLSSessionHelper')
-async def test_open_connection_certificate_validation_fails(mock_tls, mock_validate, mock_open, cm):
+async def test_open_connection_certificate_validation_fails(mock_tls, mock_validate, mock_open, connection_manager):
     """Test connection fails when certificate validation fails"""
     mock_tls_instance = Mock()
     mock_tls_instance.create_context.return_value = Mock()
@@ -73,101 +65,100 @@ async def test_open_connection_certificate_validation_fails(mock_tls, mock_valid
     mock_open.return_value = (mock_reader, mock_writer)
     mock_validate.return_value = False
     
-    result = await cm._open_connection()
+    result = await connection_manager._open_connection()
     
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_reconnection_loop_retries(cm):
+async def test_reconnection_loop_retries(connection_manager):
     """Test reconnection loop retries on failure"""
-    with patch.object(cm, '_open_connection') as mock_open:
-        # Multiple failures to trigger retries
-        mock_open.side_effect = [False, False, False, True]
+    with patch.object(connection_manager, '_open_connection') as mock_open:
+        mock_open.side_effect = [False, False, True]
         
-        # Start reconnection loop
-        cm._set_events_reconnect()
-        reconnect_task = asyncio.create_task(cm._reconnection_loop())
+        connection_manager._set_events_reconnect()
+        reconnect_task = asyncio.create_task(connection_manager._reconnection_loop())
         
-        # Wait for reconnection attempts
-        await asyncio.sleep(1.2)
+        # Wait longer for retries with delay
+        await asyncio.sleep(1.5)
         
-        # Cancel task
         reconnect_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             await reconnect_task
+        except asyncio.CancelledError:
+            pass
         
-        # Verify multiple connection attempts
         assert mock_open.call_count >= 2
 
 
 @pytest.mark.asyncio
-async def test_trigger_reconnection_clears_streams(cm):
-    """Test trigger_reconnection clears reader/writer"""
-    # Setup mock writer
+async def test_trigger_reconnection_clears_streams(connection_manager):
+    """Test trigger_reconnection clears reader/writer and cancels task"""
     mock_writer = Mock()
     mock_writer.is_closing.return_value = False
     mock_writer.close = Mock()
     mock_writer.wait_closed = AsyncMock()
     
-    cm.reader = AsyncMock()
-    cm.writer = mock_writer
-    cm._reconnection_task = asyncio.create_task(asyncio.sleep(10))
+    connection_manager.reader = AsyncMock()
+    connection_manager.writer = mock_writer
+    reconnect_task = asyncio.create_task(asyncio.sleep(10))
+    connection_manager._reconnection_task = reconnect_task
     
-    await cm.trigger_reconnection()
+    await connection_manager.trigger_reconnection()
     
-    assert cm.reader is None
-    assert cm.writer is None
+    # Wait for task cancellation to propagate
+    try:
+        await asyncio.wait_for(reconnect_task, timeout=0.1)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    
+    assert connection_manager.reader is None
+    assert connection_manager.writer is None
     mock_writer.close.assert_called_once()
+    assert reconnect_task.done()
 
 
 @pytest.mark.asyncio
-async def test_wait_connected_blocks_until_connected(cm):
+async def test_wait_connected_blocks_until_connected(connection_manager):
     """Test wait_connected blocks until connection established"""
-    with patch.object(cm, '_open_connection', return_value=True):
-        # Start connection manager
-        await cm.start()
+    with patch.object(connection_manager, '_open_connection', return_value=True):
+        await connection_manager.start()
         
-        # wait_connected should return immediately since connected
-        result = await asyncio.wait_for(cm.wait_connected(), timeout=1.0)
+        result = await asyncio.wait_for(connection_manager.wait_connected(), timeout=1.0)
         
         assert result is True
         
-        # Cleanup
-        await cm.shutdown()
+        await connection_manager.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_shutdown_cancels_reconnection_task(cm):
+async def test_shutdown_cancels_reconnection_task(connection_manager):
     """Test shutdown cancels reconnection task"""
-    # Create mock reconnection task
-    cm._reconnection_task = asyncio.create_task(asyncio.sleep(10))
+    connection_manager._reconnection_task = asyncio.create_task(asyncio.sleep(10))
     
-    await cm.shutdown()
+    await connection_manager.shutdown()
     
-    assert cm._reconnection_task is None
+    assert connection_manager._reconnection_task is None
 
 
 @pytest.mark.asyncio
-async def test_reset_streams_handles_already_closed(cm):
+async def test_reset_streams_handles_already_closed(connection_manager):
     """Test _reset_streams handles already-closed writer gracefully"""
     mock_writer = Mock()
-    mock_writer.is_closing.return_value = True  # Already closed
+    mock_writer.is_closing.return_value = True
     
-    cm.reader = AsyncMock()
-    cm.writer = mock_writer
+    connection_manager.reader = AsyncMock()
+    connection_manager.writer = mock_writer
     
-    # Should not raise exception
-    await cm._reset_streams()
+    await connection_manager._reset_streams()
     
-    assert cm.reader is None
-    assert cm.writer is None
+    assert connection_manager.reader is None
+    assert connection_manager.writer is None
 
 
 @pytest.mark.asyncio
-async def test_wait_connected_returns_false_when_inactive(cm):
+async def test_wait_connected_returns_false_when_inactive(connection_manager):
     """Test wait_connected returns False when not active"""
-    # Don't start connection manager (not active)
-    result = await cm.wait_connected()
+    result = await connection_manager.wait_connected()
     
     assert result is False

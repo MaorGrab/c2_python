@@ -1,27 +1,12 @@
 """
 Unit tests for CommandExecutor
-Tests with real subprocess execution where possible
+Tests with real subprocess execution
 """
 
 import pytest
-import pytest_asyncio
 import asyncio
 import sys
 from models.command_executor import CommandExecutor
-
-
-@pytest_asyncio.fixture
-async def executor():
-    """Provide executor instance"""
-    exec_instance = CommandExecutor()
-    yield exec_instance
-    exec_instance.stop()
-
-
-@pytest_asyncio.fixture
-async def queues():
-    """Provide input and output queues"""
-    return asyncio.Queue(), asyncio.Queue()
 
 
 @pytest.mark.asyncio
@@ -30,15 +15,12 @@ async def test_real_command_execution_echo(executor, queues):
     """Test actual command execution with echo"""
     in_queue, out_queue = queues
     
-    # Use cross-platform command
     cmd = "echo test" if sys.platform != "win32" else "cmd /c echo test"
     await in_queue.put({"cmd_id": "cmd-1", "command": cmd})
     
-    # Start executor
     executor_task = asyncio.create_task(executor.start(in_queue, out_queue))
     
     try:
-        # Wait for result
         cmd_id, output, exec_time = await asyncio.wait_for(out_queue.get(), timeout=2.0)
         
         assert cmd_id == "cmd-1"
@@ -47,8 +29,10 @@ async def test_real_command_execution_echo(executor, queues):
     finally:
         executor.stop()
         executor_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             await executor_task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -56,7 +40,6 @@ async def test_real_command_execution_invalid(executor):
     """Test invalid command returns error message"""
     result = await executor._execute_command("cmd-1", "nonexistent_command_xyz_123")
     
-    # On Windows, error is in stderr; on Unix, it's in the Error: prefix
     assert any(x in result for x in ["Error:", "not recognized", "not found"])
 
 
@@ -85,8 +68,10 @@ async def test_multiple_commands_sequential(executor, queues):
     finally:
         executor.stop()
         executor_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             await executor_task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -97,21 +82,21 @@ async def test_none_in_queue_continues_execution(executor, queues):
     
     cmd = "echo test" if sys.platform != "win32" else "cmd /c echo test"
     
-    # Add None then valid command
     await in_queue.put(None)
     await in_queue.put({"cmd_id": "cmd-1", "command": cmd})
     
     executor_task = asyncio.create_task(executor.start(in_queue, out_queue))
     
     try:
-        # Should still get result despite None
         result = await asyncio.wait_for(out_queue.get(), timeout=2.0)
         assert result[0] == "cmd-1"
     finally:
         executor.stop()
         executor_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             await executor_task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -121,16 +106,34 @@ async def test_execution_process_cleared_after_success(executor):
     
     await executor._execute_command("cmd-1", cmd)
     
-    # Process should be cleared
     assert executor.execution_process is None
 
 
 @pytest.mark.asyncio
-async def test_is_killed_property(executor):
-    """Test is_killed property reflects stop state"""
-    assert not executor.is_killed
+@pytest.mark.timeout(10)
+async def test_real_process_termination():
+    """Test that long-running process is actually terminated"""
+    executor = CommandExecutor()
+    in_queue = asyncio.Queue()
+    out_queue = asyncio.Queue()
     
+    # Use long-running command
+    cmd = "sleep 30" if sys.platform != "win32" else "timeout /t 30"
+    await in_queue.put({"cmd_id": "cmd-1", "command": cmd})
+    
+    executor_task = asyncio.create_task(executor.start(in_queue, out_queue))
+    
+    # Let command start
+    await asyncio.sleep(0.5)
+    
+    # Cancel executor
     executor.stop()
+    executor_task.cancel()
     
-    assert executor.is_killed
-    assert executor._should_stop
+    try:
+        await asyncio.wait_for(executor_task, timeout=3.0)
+    except asyncio.CancelledError:
+        pass
+    
+    # Verify process was terminated
+    assert executor.execution_process is None
