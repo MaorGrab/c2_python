@@ -3,12 +3,6 @@ Unit tests for ClientState
 Tests client lifecycle management with mocked network components
 """
 
-import sys
-from pathlib import Path
-
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-
 import unittest
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock

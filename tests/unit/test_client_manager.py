@@ -3,12 +3,6 @@ Unit tests for ClientManager
 Tests client registry and coordination functionality
 """
 
-import sys
-from pathlib import Path
-
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-
 import unittest
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock

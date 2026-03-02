@@ -1,168 +1,164 @@
 # C2 Project Tests
 
-Comprehensive test suite for the C2 (Command & Control) project.
+Modern pytest-based test suite with real operations and minimal mocking.
 
 ## Quick Start
 
 ### Run All Tests
 ```bash
-# Using unittest
+# Using pytest (recommended)
 python run_tests.py
 
-# Using pytest (if installed)
+# Or directly
 pytest tests/
+
+# With coverage
+pytest tests/ --cov=src --cov-report=html
+
+# Parallel execution
+pytest tests/ -n auto
 ```
 
 ### Run Specific Test Suite
 ```bash
-# Unit tests only
-python -m unittest discover tests/unit
+# Unit tests
+pytest tests/unit/ -v
 
-# Integration tests only
-python -m unittest discover tests/integration
+# Integration tests
+pytest tests/integration/ -v
 
-# Specific test file
-python -m unittest tests.unit.test_message
+# Functional tests (real I/O)
+pytest tests/functional/ -v
+
+# Performance tests
+pytest tests/performance/ -v -m performance
+
+# Specific file
+pytest tests/unit/test_message.py -v
 ```
 
 ## Test Structure
 
 ```
 tests/
-├── unit/                           # Unit tests (isolated components)
-│   ├── test_message.py            # Message protocol tests
-│   ├── test_encryption.py         # Encryption & key management
-│   ├── test_client_state.py      # Client lifecycle management
-│   ├── test_client_manager.py    # Client registry
-│   └── test_network.py            # Network communication
-├── integration/                    # Integration tests (component interaction)
-│   └── test_integration.py        # End-to-end flows
-└── __init__.py
+├── unit/                    # Unit tests (minimal mocking)
+├── integration/             # Integration tests
+├── functional/              # Real I/O operations
+├── performance/             # Load and stress tests
+├── fixtures/                # Shared test utilities
+│   ├── __init__.py
+│   └── test_helpers.py
+└── conftest.py              # Pytest fixtures
 ```
 
-## Test Coverage
+## Test Philosophy
 
-| Component | Coverage | Tests |
-|-----------|----------|-------|
-| Message Protocol | 100% | 10 |
-| Encryption | 95% | 12 |
-| Client State | 85% | 15 |
-| Client Manager | 80% | 12 |
-| Network | 90% | 7 |
+### Minimal Mocking
+- Unit tests use real operations where possible
+- Functional tests use real network/subprocess
+- Mocks only for external dependencies
+
+### Real Operations
+- Actual subprocess execution
+- Real TCP connections
+- Real encryption operations
+
+### Performance Testing
+- Concurrent client handling
+- Command queue stress
+- Memory leak detection
 
 ## Key Test Files
 
-### test_message.py
-Tests message serialization, deserialization, and protocol correctness.
-- JSON encoding/decoding
-- Payload format with length prefix
-- Factory methods for message types
+### Unit Tests
+- `test_message.py` - Message protocol (no mocks)
+- `test_encryption.py` - Real crypto operations
+- `test_command_executor.py` - Real subprocess execution
+- `test_network.py` - Network send/receive
 
-### test_encryption.py
-Tests ECDH key exchange and AES-256-GCM encryption.
-- Key generation and serialization
-- Session key derivation
-- Encryption/decryption roundtrip
-- Security validation
+### Functional Tests
+- `test_client_server_flow.py` - Real network operations
+- End-to-end encrypted communication
+- Connection failure handling
 
-### test_client_state.py
-Tests client lifecycle management.
-- State transitions
-- Command queue management
-- Connection cleanup
-- Encryption integration
-
-### test_client_manager.py
-Tests client registry and coordination.
-- Client registration/lookup
-- Command delegation
-- Shutdown coordination
-
-### test_network.py
-Tests network message transmission.
-- Send/receive with length prefix
-- Error handling
-- Connection failures
-
-### test_integration.py
-Tests end-to-end flows.
-- Complete key exchange
-- Multi-message encryption
-- Registration flow
-- Command/result flow
+### Performance Tests
+- `test_load.py` - Concurrent clients, stress testing
+- Marked with `@pytest.mark.performance`
 
 ## Running with Coverage
 
 ```bash
-# Install coverage tools
-pip install pytest pytest-cov coverage
-
-# Run with coverage report
+# HTML report
 pytest tests/ --cov=src --cov-report=html
 
-# View coverage report
-# Open htmlcov/index.html in browser
+# Terminal report
+pytest tests/ --cov=src --cov-report=term-missing
+
+# Minimum coverage threshold
+pytest tests/ --cov=src --cov-fail-under=80
 ```
 
-## Writing New Tests
+## Pytest Features Used
 
-### Unit Test Template
+### Fixtures
+- Reusable test setup in `conftest.py`
+- `encryption_pair`, `key_manager_pair`, etc.
+
+### Markers
+- `@pytest.mark.asyncio` - Async tests
+- `@pytest.mark.timeout(N)` - Timeout protection
+- `@pytest.mark.performance` - Performance tests
+
+### Parametrization
 ```python
-import unittest
-from unittest.mock import Mock, AsyncMock
-
-class TestMyComponent(unittest.TestCase):
-    def setUp(self):
-        # Setup before each test
-        pass
-    
-    def test_feature(self):
-        # Arrange
-        component = MyComponent()
-        
-        # Act
-        result = component.do_something()
-        
-        # Assert
-        self.assertEqual(result, expected)
+@pytest.mark.parametrize("input,expected", [
+    ("test1", "result1"),
+    ("test2", "result2"),
+])
+def test_multiple_cases(input, expected):
+    assert process(input) == expected
 ```
 
-### Async Test Template
-```python
-import unittest
+## Parallel Execution
 
-class TestMyAsyncComponent(unittest.IsolatedAsyncioTestCase):
-    async def test_async_feature(self):
-        # Arrange
-        component = MyAsyncComponent()
-        
-        # Act
-        result = await component.do_something_async()
-        
-        # Assert
-        self.assertEqual(result, expected)
+```bash
+# Run tests in parallel
+pytest tests/ -n auto
+
+# Specify worker count
+pytest tests/ -n 4
 ```
 
-## Mocking Guidelines
+## CI/CD Integration
 
-### Mock Network I/O
-```python
-from unittest.mock import AsyncMock, Mock
+Tests run automatically:
+- Pre-commit hooks
+- Pull request checks
+- Deployment pipeline
 
-mock_reader = AsyncMock()
-mock_writer = Mock()
-mock_writer.write = Mock()
-mock_writer.drain = AsyncMock()
+## Troubleshooting
+
+### Import Errors
+Ensure running from project root:
+```bash
+cd c2_python
+pytest tests/
 ```
 
-### Mock Functions
+### Async Test Issues
+Use `@pytest.mark.asyncio` decorator:
 ```python
-from unittest.mock import patch
+@pytest.mark.asyncio
+async def test_something():
+    await async_function()
+```
 
-@patch('module.function_name')
-def test_with_mock(self, mock_func):
-    mock_func.return_value = "mocked"
-    # Test code
+### Timeout Issues
+Increase timeout for slow tests:
+```python
+@pytest.mark.timeout(30)
+async def test_slow_operation():
+    # ...
 ```
 
 ## Best Practices
@@ -170,38 +166,5 @@ def test_with_mock(self, mock_func):
 1. **Isolation**: Each test should be independent
 2. **Clarity**: Use descriptive test names
 3. **Coverage**: Test happy paths and error cases
-4. **Speed**: Mock slow operations
+4. **Speed**: Mock only when necessary
 5. **Maintainability**: Keep tests simple and readable
-
-## Troubleshooting
-
-### Import Errors
-Ensure you're running from project root:
-```bash
-cd c2_python
-python -m unittest tests.unit.test_message
-```
-
-### Async Test Issues
-Use `IsolatedAsyncioTestCase` for async tests:
-```python
-class TestAsync(unittest.IsolatedAsyncioTestCase):
-    async def test_something(self):
-        await async_function()
-```
-
-### Mock Not Working
-- Use `AsyncMock` for async functions
-- Use `Mock` for sync functions
-- Verify patch path is correct
-
-## CI/CD Integration
-
-Tests should run automatically:
-- Pre-commit hooks
-- Pull request checks
-- Deployment pipeline
-
-## Documentation
-
-See [TESTING.md](../TESTING.md) for comprehensive testing documentation.
