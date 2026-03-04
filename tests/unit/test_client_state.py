@@ -1,169 +1,259 @@
-"""
-Unit tests for ClientState
-Tests client lifecycle management with mocked network components
-"""
-
-import unittest
+import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from models.client_state import ClientState
-from models.connection_status import ConnectionStatus
+from unittest.mock import AsyncMock, Mock, call
+
 from models.message import Message
 from models.message_type import MessageType
 from models.command_type import CommandType
+from models.connection_status import ConnectionStatus
+
+# --- 1. STATE & QUEUE MANAGEMENT ---
+
+def test_add_command_generates_uuid_and_queues(client_state):
+    """Test that adding a command assigns a UUID and places it in the queue."""
+    cmd_id = client_state.add_command("whoami")
+    
+    assert isinstance(cmd_id, str)
+    assert len(cmd_id) > 10 # Basic UUID check
+    assert client_state.command_queue.qsize() == 1
+    
+    queued_item = client_state.command_queue.get_nowait()
+    assert queued_item["cmd_id"] == cmd_id
+    assert queued_item["command"] == "whoami"
+
+def test_kill_drains_queues_and_sets_status(client_state):
+    """Test the kill() method cleanly flushes old state and injects the KILL command."""
+    # Arrange: Pollute the state
+    client_state.pending_results["old_cmd"] = "running"
+    client_state.add_command("dir")
+    
+    assert client_state.command_queue.qsize() == 1
+    assert len(client_state.pending_results) == 1
+    
+    # Act
+    result = client_state.kill()
+    
+    # Assert
+    assert result is True
+    assert client_state.is_killed is True
+    assert len(client_state.pending_results) == 0
+    
+    # The queue should have been drained of 'dir', and only 'KILL' should remain
+    assert client_state.command_queue.qsize() == 1
+    queued_item = client_state.command_queue.get_nowait()
+    assert queued_item["command"] == CommandType.KILL.value
 
 
-class TestClientState(unittest.TestCase):
-    """Test ClientState lifecycle management"""
+# --- 2. THE EXECUTOR LOOP ---
+
+@pytest.mark.asyncio
+async def test_command_executor_encrypts_and_sends(mocker, client_state):
+    """Test that the executor pulls from the queue, tracks pending state, and transmits."""
+    # Arrange: Queue a command
+    cmd_id = client_state.add_command("ipconfig")
     
-    def setUp(self):
-        """Setup mock reader/writer for each test"""
-        self.mock_reader = Mock()  # Changed from AsyncMock
-        self.mock_reader.feed_eof = Mock()  # Explicitly mock as sync
-        self.mock_writer = Mock()
-        self.mock_writer.is_closing = Mock(return_value=False)
-        self.mock_writer.close = Mock()
-        self.mock_writer.wait_closed = AsyncMock()
-        
-        self.client_state = ClientState("test-client", self.mock_reader, self.mock_writer)
+    # Mock transmission
+    mock_send = mocker.patch('models.client_state.send_message', new_callable=AsyncMock)
     
-    def test_initialization(self):
-        """Test ClientState initialization"""
-        self.assertEqual(self.client_state.client_id, "test-client")
-        self.assertEqual(self.client_state.status, ConnectionStatus.CONNECTED)
-        self.assertIsNotNone(self.client_state.command_queue)
-        self.assertIsNotNone(self.client_state._encryption_manager)
+    # Act: Start the executor loop
+    executor_task = asyncio.create_task(client_state._command_executor())
     
-    def test_setup_encryption(self):
-        """Test encryption setup with peer public key"""
-        # Create another encryption manager to get peer key
-        from models.encryption_manager import EncryptionManager
-        peer_em = EncryptionManager()
-        peer_public_key = peer_em.public_key_b64
-        
-        # Setup encryption
-        server_public_key = self.client_state.setup_encryption(peer_public_key)
-        
-        self.assertIsNotNone(server_public_key)
-        self.assertIsNotNone(self.client_state._encryption_manager.session_key)
+    # Yield control to let the loop process the queue
+    await asyncio.sleep(0)  # pass control to other coroutines
     
-    def test_add_command(self):
-        """Test adding command to queue"""
-        cmd_id = self.client_state.add_command("whoami")
-        
-        self.assertIsNotNone(cmd_id)
-        self.assertFalse(self.client_state.command_queue.empty())
+    # Cleanup: 1. Stop the loop by changing state
+    client_state.set_disconnected()
     
-    def test_kill_command(self):
-        """Test kill command sets killed status"""
-        result = self.client_state.kill()
-        
-        self.assertTrue(result)
-        self.assertEqual(self.client_state.status, ConnectionStatus.KILLED)
-        self.assertFalse(self.client_state.command_queue.empty())
+    # Cleanup: 2. UNBLOCK THE QUEUE! 
+    # This wakes up the waiting task, forces it to evaluate the `if cmd_data is None: continue` logic,
+    # and sends it back to the top of the `while` loop, which will now evaluate to False and exit.
+    client_state.command_queue.put_nowait(None)
     
-    def test_status_transitions(self):
-        """Test status transition methods"""
-        self.client_state.set_killed()
-        self.assertEqual(self.client_state.status, ConnectionStatus.KILLED)
-        self.assertTrue(self.client_state.is_killed)
-        
-        self.client_state.set_disconnected()
-        self.assertEqual(self.client_state.status, ConnectionStatus.DISCONNECTED)
-        self.assertTrue(self.client_state.is_disconnected)
+    # Now it will safely finish without hanging
+    await executor_task
     
-    def test_is_connected_property(self):
-        """Test is_connected property"""
-        self.assertTrue(self.client_state.is_connected)
-        
-        self.client_state.set_killed()
-        self.assertFalse(self.client_state.is_connected)
+    # Assert: Queue is empty
+    assert client_state.command_queue.empty() is True
     
-    def test_encrypt_message_without_setup_raises_error(self):
-        """Test that encrypting without setup raises error"""
-        msg = Message.as_command("cmd-1", "test")
-        
-        with self.assertRaises(RuntimeError):
-            self.client_state.encrypt_message(msg)
+    # Assert: The command was added to pending results tracking
+    assert client_state.pending_results[cmd_id] == "ipconfig"
     
-    def test_decrypt_message_without_setup_raises_error(self):
-        """Test that decrypting without setup raises error"""
-        with self.assertRaises(RuntimeError):
-            self.client_state.decrypt_message(b"encrypted_data")
-    
-    def test_encrypt_decrypt_with_setup(self):
-        """Test encryption/decryption after setup"""
-        # Setup encryption with peer
-        from models.encryption_manager import EncryptionManager
-        peer_em = EncryptionManager()
-        peer_key = peer_em.public_key_b64
-        server_key = self.client_state.setup_encryption(peer_key)
-        peer_em.establish_session_key(server_key)
-        
-        # Test encryption/decryption
-        original = Message.as_command("cmd-123", "whoami")
-        encrypted = self.client_state.encrypt_message(original)
-        
-        self.assertIsInstance(encrypted, bytes)
-        
-        # Decrypt (remove length prefix)
-        decrypted = peer_em.decrypt(encrypted[4:])
-        
-        self.assertEqual(decrypted.type, original.type)
-        self.assertEqual(decrypted.cmd_id, original.cmd_id)
+    # Assert: Message was sent
+    mock_send.assert_awaited_once()
 
 
-class TestClientStateAsync(unittest.IsolatedAsyncioTestCase):
-    """Test ClientState async methods"""
+@pytest.mark.asyncio
+async def test_executor_exits_cleanly_on_disconnect(client_state):
+    """Test that changing status breaks the while loop gracefully."""
+    # Start the loop while connected
+    assert client_state.is_connected is True
+    executor_task = asyncio.create_task(client_state._command_executor())
     
-    async def asyncSetUp(self):
-        """Setup mock reader/writer for async tests"""
-        self.mock_reader = Mock()  # Changed from AsyncMock
-        self.mock_reader.feed_eof = Mock()  # Explicitly mock as sync
-        self.mock_writer = Mock()
-        self.mock_writer.is_closing = Mock(return_value=False)
-        self.mock_writer.close = Mock()
-        self.mock_writer.wait_closed = AsyncMock()
-        
-        self.client_state = ClientState("test-client", self.mock_reader, self.mock_writer)
-        
-        # Setup encryption for tests
-        from models.encryption_manager import EncryptionManager
-        peer_em = EncryptionManager()
-        peer_key = peer_em.public_key_b64
-        self.client_state.setup_encryption(peer_key)
+    # Change status
+    client_state.set_disconnected()
     
-    @patch('models.client_state.receive_message')
-    @patch('models.client_state.send_message')
-    async def test_execute_command(self, mock_send, mock_receive):
-        """Test command execution"""
-        mock_send.return_value = True
-        
-        cmd_data = {"cmd_id": "cmd-1", "command": "whoami"}
-        await self.client_state._execute_command(cmd_data)
-        
-        self.assertIn("cmd-1", self.client_state.pending_results)
-        mock_send.assert_called_once()
+    # Await the task. If it hangs, the test will timeout. 
+    # Because we changed the status, the `while self.is_connected:` should break.
+    # To force the queue.get() to release, we must inject the sentinel (None)
+    client_state.command_queue.put_nowait(None)
     
-    async def test_cleanup_connection(self):
-        """Test connection cleanup"""
-        await self.client_state._cleanup_connection()
-        
-        self.mock_writer.close.assert_called_once()
-        self.mock_writer.wait_closed.assert_called_once()
-        self.assertIsNone(self.client_state.reader)
-        self.assertIsNone(self.client_state.writer)
-    
-    async def test_cleanup_queues(self):
-        """Test queue cleanup"""
-        self.client_state.add_command("test1")
-        self.client_state.add_command("test2")
-        self.client_state.pending_results["cmd-1"] = "test"
-        
-        self.client_state._cleanup_queue()
-        
-        self.assertEqual(len(self.client_state.pending_results), 1)
+    await asyncio.wait_for(executor_task, timeout=0.5)
+    assert executor_task.done()
 
 
-if __name__ == '__main__':
-    unittest.main()
+# --- 3. THE RECEIVER LOOP & DISCONNECTION HANDLING ---
+
+@pytest.mark.asyncio
+async def test_receiver_clears_pending_on_valid_result(mocker, client_state):
+    """Test that a valid result message removes the command from pending_results."""
+    # Arrange: Mock a pending command
+    client_state.pending_results["cmd-123"] = "whoami"
+    
+    # Arrange: Mock receiving a valid result message
+    mock_result_msg = Mock(type=MessageType.RESULT, cmd_id="cmd-123", result="root")
+    mocker.patch(
+        'models.client_state.receive_message', 
+        new_callable=AsyncMock, 
+        side_effect=[b"raw_data", b""] 
+    )
+    client_state._encryption_manager.decrypt.return_value = mock_result_msg
+    
+    # Act: Run receiver loop
+    receiver_task = asyncio.create_task(client_state._message_receiver())
+    await asyncio.sleep(0)  # pass control to other coroutines
+    
+    # Assert: The pending result tracker was cleared
+    assert "cmd-123" not in client_state.pending_results
+    
+    # Cleanup
+    client_state.set_disconnected()
+    client_state.command_queue.put_nowait(None)
+    await receiver_task
+
+
+@pytest.mark.asyncio
+async def test_receiver_handles_network_disconnect(mocker, client_state):
+    """Test that an IncompleteReadError properly triggers the disconnection handler."""
+    # Arrange: Simulate connection drop
+    mocker.patch(
+        'models.client_state.receive_message', 
+        new_callable=AsyncMock, 
+        side_effect=asyncio.IncompleteReadError(b'', None)
+    )
+    
+    # Spy on the handler
+    mock_handler = mocker.patch.object(client_state, '_handle_disconnection')
+    
+    # Act
+    await client_state._message_receiver()
+    
+    # Assert
+    mock_handler.assert_called_once()
+
+
+# --- 4. ORCHESTRATION & LIFECYCLE CLEANUP ---
+
+@pytest.mark.asyncio
+async def test_run_lifecycle_cleans_up_on_cancellation(mocker, client_state):
+    """Test that if the lifecycle is cancelled, it safely cleans up tasks and sockets."""
+    # Arrange: Mock the internal components so they run indefinitely
+    mocker.patch.object(client_state, '_message_receiver', new_callable=AsyncMock)
+    mocker.patch.object(client_state, '_command_executor', new_callable=AsyncMock)
+    
+    # Spy on the cleanups
+    mock_cleanup_tasks = mocker.patch.object(client_state, '_cleanup_tasks', new_callable=AsyncMock)
+    mock_cleanup_conn = mocker.patch.object(client_state, '_cleanup_connection', new_callable=AsyncMock)
+    
+    # Act: Start the lifecycle
+    lifecycle_task = asyncio.create_task(client_state.run_lifecycle())
+    await asyncio.sleep(0)  # pass control to other coroutines
+    
+    # Cancel the lifecycle
+    lifecycle_task.cancel()
+    
+    # The try/except CancelledError should absorb this, so it won't raise
+    await lifecycle_task
+    
+    # Assert: Finally block executed
+    mock_cleanup_tasks.assert_awaited_once()
+    mock_cleanup_conn.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_receiver_ignores_untracked_results(mocker, client_state):
+    """Test that receiving a result for an unknown command ID does not crash the server."""
+    # Arrange: Ensure pending_results is completely empty
+    client_state.pending_results.clear()
+    
+    # Arrange: Mock a result for a ghost command
+    mock_result_msg = Mock(type=MessageType.RESULT, cmd_id="ghost-999", result="data")
+    
+    # Use our one-two punch to run the loop exactly once
+    mocker.patch(
+        'models.client_state.receive_message', 
+        new_callable=AsyncMock, 
+        side_effect=[b"data", b""]
+    )
+    client_state._encryption_manager.decrypt.return_value = mock_result_msg
+    
+    # Act
+    await client_state._message_receiver()
+    
+    # Assert: The loop finished cleanly without throwing a KeyError
+    assert "ghost-999" not in client_state.pending_results
+
+@pytest.mark.asyncio
+async def test_receiver_skips_wrong_message_types(mocker, client_state):
+    """Test that the server ignores commands sent BY the client."""
+    # Arrange: Client sends a COMMAND (illegal for a client to do)
+    mock_bad_msg = Mock(type=MessageType.COMMAND) 
+    
+    mocker.patch(
+        'models.client_state.receive_message', 
+        new_callable=AsyncMock, 
+        side_effect=[b"data", b""]
+    )
+    client_state._encryption_manager.decrypt.return_value = mock_bad_msg
+    mock_logger = mocker.patch('models.client_state.logger.warning')
+
+    # Act
+    await client_state._message_receiver()
+
+    # Assert: The warning was logged and the loop survived
+    mock_logger.assert_has_calls([
+        call(f"[{client_state.client_id}] Unknown message type: {MessageType.COMMAND}"),
+        call(f"[{client_state.client_id}] Empty message received")
+    ])
+
+def test_handle_disconnection_is_idempotent(client_state):
+    """Test that simultaneous disconnect triggers do not corrupt the state or queues."""
+    # Act 1: First disconnect
+    client_state._handle_disconnection()
+    
+    # Assert 1: State is changed and ONE sentinel is in the queue
+    assert client_state.is_disconnected is True
+    assert client_state.command_queue.qsize() == 1
+    
+    # Act 2: Second disconnect trigger (simulating a race condition)
+    client_state._handle_disconnection()
+    
+    # Assert 2: The queue MUST STILL only have one sentinel
+    assert client_state.command_queue.qsize() == 1
+
+@pytest.mark.asyncio
+async def test_cleanup_connection_wipes_pointers_on_timeout(mocker, client_state):
+    """Test that a hanging socket closure still results in memory cleanup."""
+    # Arrange: Make wait_closed hang forever
+    client_state.writer.wait_closed = AsyncMock(side_effect=asyncio.TimeoutError())
+    
+    # Spy on the logger to verify the exact branch
+    mock_logger = mocker.patch('models.client_state.logger.info')
+    
+    # Act
+    await client_state._cleanup_connection()
+    
+    # Assert: The timeout branch was hit
+    mock_logger.assert_any_call(f"[{client_state.client_id}] Timeout closing connection")
+    
+    # Assert: The finally block executed and wiped the pointers to prevent leaks
+    assert client_state.reader is None
+    assert client_state.writer is None

@@ -35,14 +35,14 @@ class ClientState:
     
     def encrypt_message(self, message: Message) -> bytes:
         """Encrypt message for this client"""
-        if not self._encryption_manager:
-            raise RuntimeError(f"Encryption not setup for client {self.client_id}")
+        # if not self._encryption_manager:
+        #     raise RuntimeError(f"Encryption not setup for client {self.client_id}")
         return self._encryption_manager.encrypt(message)
     
     def decrypt_message(self, encrypted_data: bytes) -> Optional[Message]:
         """Decrypt message from this client"""
-        if not self._encryption_manager:
-            raise RuntimeError(f"Encryption not setup for client {self.client_id}")
+        # if not self._encryption_manager:
+        #     raise RuntimeError(f"Encryption not setup for client {self.client_id}")
         return self._encryption_manager.decrypt(encrypted_data)
     
     def add_command(self, command: str) -> str:

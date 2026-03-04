@@ -79,8 +79,10 @@ class CommunicationManager:
     async def _cleanup_tasks(self):
         """Cleanup tasks"""
         self._active.clear()
-        await cancel_task(self._listener_task, related_queue=self.command_queue)
-        await cancel_task(self._talker_task, related_queue=self.result_queue)
+        if self._listener_task:
+            await cancel_task(self._listener_task, related_queue=self.command_queue)
+        if self._talker_task:
+            await cancel_task(self._talker_task, related_queue=self.result_queue)
         logger.info("Communication manager cancelled tasks")
 
     async def _listener(self):

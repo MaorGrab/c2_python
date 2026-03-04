@@ -18,6 +18,8 @@ def drain_queue(queue: asyncio.Queue):
         logger.error(f"Error draining queue: {e}")
 
 async def cancel_task(task: asyncio.Task, related_queue: Optional[asyncio.Queue] = None):
+    if task is None:
+        return
     task_name = f'"{task.get_name()}"'
     try:
         if related_queue and not related_queue.empty():

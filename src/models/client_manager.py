@@ -1,6 +1,5 @@
 """
 Client Registry for C2 Server
-Simple registry following SOLID principles - Single Responsibility
 """
 
 import asyncio

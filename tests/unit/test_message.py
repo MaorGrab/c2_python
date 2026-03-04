@@ -1,109 +1,104 @@
-"""
-Unit tests for Message protocol
-Tests serialization, deserialization, and message creation
-"""
 import pytest
 import json
 from models.message import Message
 from models.message_type import MessageType
 
+# --- 1. FACTORY METHOD TESTS ---
 
-def test_message_to_json():
-    """Test message serialization to JSON"""
-    msg = Message(type=MessageType.COMMAND, cmd_id="123", command="whoami")
+@pytest.mark.parametrize("factory_func, kwargs, expected_type, expected_attrs", [
+    (Message.as_register, {"client_id": "c1", "shared_key": "pub_key"}, MessageType.REGISTER, {"client_id": "c1", "command": "pub_key"}),
+    (Message.as_ack, {"client_id": "c2", "peer_key": "srv_key"}, MessageType.ACK, {"client_id": "c2", "command": "srv_key"}),
+    (Message.as_command, {"cmd_id": "cmd1", "command": "ls"}, MessageType.COMMAND, {"cmd_id": "cmd1", "command": "ls"}),
+    (Message.as_result, {"cmd_id": "cmd2", "result": "ok", "exec_time_ms": 1.5}, MessageType.RESULT, {"cmd_id": "cmd2", "result": "ok", "exec_time_ms": 1.5}),
+])
+def test_message_factories(factory_func, kwargs, expected_type, expected_attrs):
+    """Test all factory methods correctly map arguments to the dataclass."""
+    msg = factory_func(**kwargs)
+    
+    assert msg.type == expected_type
+    for attr, expected_val in expected_attrs.items():
+        assert getattr(msg, attr) == expected_val
+
+
+# --- 2. SERIALIZATION & ENCODING RULES ---
+
+def test_to_json_strips_none_values():
+    """Test that the serialization actively removes None values to save network bandwidth."""
+    msg = Message(type=MessageType.COMMAND, cmd_id="123")
     json_str = msg.to_json()
     data = json.loads(json_str)
     
-    assert data["type"] == "command"
-    assert data["cmd_id"] == "123"
-    assert data["command"] == "whoami"
+    assert "cmd_id" in data
+    assert "client_id" not in data
     assert "result" not in data
 
-
-def test_message_from_json():
-    """Test message deserialization from JSON"""
-    json_str = '{"type": "result", "cmd_id": "456", "result": "output", "exec_time_ms": 100.5}'
-    msg = Message.from_json(json_str)
+def test_utf8_encoding_survival():
+    """Test that multi-byte characters (e.g., emojis, foreign text) survive the payload roundtrip."""
+    complex_text = "Result with emoji 🛑 and cyrillic привет"
+    msg = Message(type=MessageType.RESULT, result=complex_text)
     
-    assert msg.type == MessageType.RESULT
-    assert msg.cmd_id == "456"
-    assert msg.result == "output"
-    assert msg.exec_time_ms == 100.5
-
-
-def test_message_to_payload_without_prefix():
-    """Test payload creation without length prefix"""
-    msg = Message(type=MessageType.ACK, client_id="client-1")
-    payload = msg.to_payload(with_prefix=False)
-    
-    assert isinstance(payload, bytes)
-
-
-def test_message_to_payload_with_prefix():
-    """Test payload creation with length prefix"""
-    msg = Message(type=MessageType.ACK, client_id="client-1")
-    payload = msg.to_payload(with_prefix=True)
-    
-    length = int.from_bytes(payload[:4], 'big')
-    assert length == len(payload) - 4
-
-
-def test_message_from_payload():
-    """Test message deserialization from payload"""
-    original = Message(type=MessageType.COMMAND, cmd_id="789", command="ls")
-    payload = original.to_payload(with_prefix=False)
-    
+    payload = msg.to_payload()
     reconstructed = Message.from_payload(payload)
     
-    assert reconstructed.type == original.type
-    assert reconstructed.cmd_id == original.cmd_id
-    assert reconstructed.command == original.command
+    assert reconstructed.result == complex_text
 
-
-def test_as_register():
-    """Test register message factory"""
-    msg = Message.as_register("client-123", "public_key_data")
+def test_payload_prefix_byte_math(sample_message):
+    """Test the exact byte structure of the big-endian length prefix."""
+    payload = sample_message.to_payload(with_prefix=True)
     
-    assert msg.type == MessageType.REGISTER
-    assert msg.client_id == "client-123"
-    assert msg.command == "public_key_data"
-
-
-def test_as_ack():
-    """Test acknowledgment message factory"""
-    msg = Message.as_ack("client-456", "server_public_key")
+    # 1. Extract the first 4 bytes
+    prefix_bytes = payload[:4]
+    # 2. Extract the actual JSON message bytes
+    message_bytes = payload[4:]
     
-    assert msg.type == MessageType.ACK
-    assert msg.client_id == "client-456"
-    assert msg.command == "server_public_key"
+    # Assert big-endian conversion is mathematically correct
+    expected_length = len(message_bytes)
+    assert int.from_bytes(prefix_bytes, byteorder='big') == expected_length
 
 
-def test_as_command():
-    """Test command message factory"""
-    msg = Message.as_command("cmd-001", "whoami")
+# --- 3. DESERIALIZATION BOUNDARIES (EDGE CASES) ---
+
+def test_from_payload_handles_empty_bytes():
+    """Test that a silent network drop (empty bytes) safely returns None."""
+    result = Message.from_payload(b"")
+    assert result is None
+
+def test_from_json_raises_on_invalid_json():
+    """Test that malformed JSON strings bubble up standard decoding errors."""
+    with pytest.raises(json.JSONDecodeError):
+        Message.from_json("{this_is_not_json: true}")
+
+def test_from_json_raises_on_invalid_enum():
+    """Test that if an attacker sends an unknown MessageType, it is strictly rejected."""
+    bad_json = json.dumps({"type": "UNKNOWN_HACKER_TYPE", "cmd_id": "1"})
     
-    assert msg.type == MessageType.COMMAND
-    assert msg.cmd_id == "cmd-001"
-    assert msg.command == "whoami"
+    # Trying to cast a string not in the Enum raises ValueError
+    with pytest.raises(ValueError):
+        Message.from_json(bad_json)
 
-
-def test_as_result():
-    """Test result message factory"""
-    msg = Message.as_result("cmd-002", "root", 50.25)
+def test_from_payload_raises_on_invalid_utf8():
+    """Test that non-UTF-8 garbage bytes fail decoding immediately."""
+    garbage_bytes = b"\xff\xfe\xfd"  # Invalid utf-8 sequence
     
-    assert msg.type == MessageType.RESULT
-    assert msg.cmd_id == "cmd-002"
-    assert msg.result == "root"
-    assert msg.exec_time_ms == 50.25
+    with pytest.raises(UnicodeDecodeError):
+        Message.from_payload(garbage_bytes)
 
-
-def test_roundtrip_serialization():
-    """Test complete serialization roundtrip"""
-    original = Message.as_result("cmd-999", "test output", 123.45)
-    json_str = original.to_json()
-    reconstructed = Message.from_json(json_str)
+def test_from_json_raises_on_missing_type_key():
+    """Test that valid JSON missing the mandatory 'type' field throws a KeyError."""
+    # Valid JSON, but no "type" defined
+    incomplete_json = json.dumps({"cmd_id": "123", "command": "whoami"})
     
-    assert reconstructed.type == original.type
-    assert reconstructed.cmd_id == original.cmd_id
-    assert reconstructed.result == original.result
-    assert reconstructed.exec_time_ms == original.exec_time_ms
+    with pytest.raises(KeyError):
+        Message.from_json(incomplete_json)
+
+def test_from_json_raises_on_unexpected_fields():
+    """Test that injecting unknown fields crashes the dataclass constructor."""
+    # Valid type, valid syntax, but contains an extra unauthorized field
+    rogue_json = json.dumps({
+        "type": MessageType.COMMAND.value, 
+        "cmd_id": "123", 
+        "hacker_field": "bypassed"
+    })
+    
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        Message.from_json(rogue_json)

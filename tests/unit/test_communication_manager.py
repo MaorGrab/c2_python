@@ -1,213 +1,261 @@
-"""
-Unit tests for CommunicationManager
-Tests with real encryption, mocking only I/O boundary
-"""
-
 import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock
-from models.communication_manager import CommunicationManager
+from unittest.mock import AsyncMock, Mock
+
 from models.message import Message
 from models.message_type import MessageType
 from models.command_type import CommandType
 
+# --- 1. HANDSHAKE TESTS ---
 
 @pytest.mark.asyncio
-async def test_handshake_success(cm, peer_em):
-    """Test successful handshake with real encryption"""
-    mock_reader = AsyncMock()
-    mock_writer = Mock()
-    written_data = []
+async def test_handshake_success(mocker, communication_manager):
+    """Test successful handshake logic sets session key."""
+    # Arrange: Mock send success
+    mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
     
-    mock_writer.write = Mock(side_effect=lambda d: written_data.append(d))
-    mock_writer.drain = AsyncMock()
+    # Arrange: Mock receive success with valid ACK
+    mock_ack_msg = Message.as_ack("server", "server_public_key")
+    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
+    mocker.patch('models.communication_manager.Message.from_payload', return_value=mock_ack_msg)
     
-    cm._connection_manager.reader = mock_reader
-    cm._connection_manager.writer = mock_writer
+    # Act
+    result = await communication_manager._perform_handshake()
     
-    ack_msg = Message.as_ack("test-client", peer_em.public_key_b64)
-    ack_payload = ack_msg.to_payload(with_prefix=False)
-    ack_length = len(ack_payload).to_bytes(4, 'big')
-    
-    mock_reader.readexactly = AsyncMock(side_effect=[ack_length, ack_payload])
-    
-    result = await cm._perform_handshake()
-    
+    # Assert
     assert result is True
-    assert cm._encryption_manager.session_key is not None
-    assert len(written_data) == 1
-    assert len(written_data[0]) > 4
-
+    communication_manager._encryption_manager.establish_session_key.assert_called_once_with("server_public_key")
 
 @pytest.mark.asyncio
-async def test_handshake_failure_no_ack(cm):
-    """Test handshake failure when no ACK received"""
-    mock_reader = AsyncMock()
-    mock_writer = Mock()
-    mock_writer.write = Mock()
-    mock_writer.drain = AsyncMock()
+async def test_handshake_fails_on_invalid_ack(mocker, communication_manager):
+    """Test handshake fails if server returns something other than an ACK."""
+    mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
+    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
     
-    cm._connection_manager.reader = mock_reader
-    cm._connection_manager.writer = mock_writer
+    # Mock a COMMAND message instead of an ACK
+    invalid_msg = Message.as_command("cmd-1", "whoami")
+    mocker.patch('models.communication_manager.Message.from_payload', return_value=invalid_msg)
     
-    mock_reader.readexactly = AsyncMock(side_effect=asyncio.IncompleteReadError(b'', 4))
-    
-    result = await cm._perform_handshake()
+    result = await communication_manager._perform_handshake()
     
     assert result is False
+    communication_manager._encryption_manager.establish_session_key.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_handshake_invalid_ack_type(cm):
-    """Test handshake fails with invalid ACK message type"""
-    mock_reader = AsyncMock()
-    mock_writer = Mock()
-    mock_writer.write = Mock()
-    mock_writer.drain = AsyncMock()
-    
-    cm._connection_manager.reader = mock_reader
-    cm._connection_manager.writer = mock_writer
-    
-    invalid_msg = Message.as_command("cmd-1", "test")
-    invalid_payload = invalid_msg.to_payload(with_prefix=False)
-    invalid_length = len(invalid_payload).to_bytes(4, 'big')
-    
-    mock_reader.readexactly = AsyncMock(side_effect=[invalid_length, invalid_payload])
-    
-    result = await cm._perform_handshake()
-    
-    assert result is False
-
+# --- 2. LISTENER TESTS ---
 
 @pytest.mark.asyncio
-async def test_listener_receives_command(cm, peer_em):
-    """Test listener receives and queues commands with real encryption"""
-    cm._encryption_manager.establish_session_key(peer_em.public_key_b64)
-    peer_em.establish_session_key(cm._encryption_manager.public_key_b64)
+async def test_listener_routes_commands_and_skips_non_commands(mocker, communication_manager):
+    """Test listener drops non-command messages (like stray ACKs) but queues valid ones."""
+    # Arrange: We only test the valid decryption path here
+    mock_non_cmd = Mock(type=MessageType.ACK)
+    mock_valid_cmd = Mock(type=MessageType.COMMAND, cmd_id="123", command="whoami")
     
-    mock_reader = AsyncMock()
-    cm._connection_manager.reader = mock_reader
-    
-    cmd_msg = Message.as_command("cmd-1", "whoami")
-    encrypted = peer_em.encrypt(cmd_msg)
-    encrypted_data = encrypted[4:]
-    length_prefix = len(encrypted_data).to_bytes(4, 'big')
-    
-    mock_reader.readexactly = AsyncMock(
-        side_effect=[length_prefix, encrypted_data, asyncio.IncompleteReadError(b'', 4)]
+    # Setup the receive loop to yield 2 items, then gracefully exit with None
+    mocker.patch(
+        'models.communication_manager.receive_message', 
+        new_callable=AsyncMock, 
+        side_effect=["payload_ack", "payload_cmd", None]
     )
     
-    with pytest.raises(asyncio.IncompleteReadError):
-        await cm._listener()
+    communication_manager._encryption_manager.decrypt.side_effect = [
+        mock_non_cmd, 
+        mock_valid_cmd
+    ]
     
-    assert not cm.command_queue.empty()
-    cmd_data = await cm.command_queue.get()
-    assert cmd_data["cmd_id"] == "cmd-1"
-    assert cmd_data["command"] == "whoami"
+    # Act
+    await communication_manager._listener()
+    
+    # Assert: Only the valid command made it to the queue
+    assert communication_manager.command_queue.qsize() == 1
+    queued_item = await communication_manager.command_queue.get()
+    assert queued_item["cmd_id"] == "123"
+    assert queued_item["command"] == "whoami"
 
 
 @pytest.mark.asyncio
-async def test_listener_handles_kill_command(cm, peer_em):
-    """Test listener handles KILL command with real encryption"""
-    cm._encryption_manager.establish_session_key(peer_em.public_key_b64)
-    peer_em.establish_session_key(cm._encryption_manager.public_key_b64)
+async def test_listener_aborts_on_decryption_failure(mocker, communication_manager):
+    """Test listener intentionally breaks the loop to force a reconnection if decryption fails."""
+    # Arrange: Mock a received message
+    mocker.patch(
+        'models.communication_manager.receive_message', 
+        new_callable=AsyncMock, 
+        return_value="corrupted_payload"
+    )
     
-    mock_reader = AsyncMock()
-    cm._connection_manager.reader = mock_reader
-    cm._connection_manager.shutdown = AsyncMock()
+    # Arrange: Force decryption to fail
+    communication_manager._encryption_manager.decrypt.return_value = None
     
-    kill_msg = Message.as_command("cmd-kill", CommandType.KILL.value)
-    encrypted = peer_em.encrypt(kill_msg)
-    encrypted_data = encrypted[4:]
-    length_prefix = len(encrypted_data).to_bytes(4, 'big')
+    # Spy on the logger to ensure the warning fires
+    mock_logger = mocker.patch('models.communication_manager.logger.warning')
     
-    mock_reader.readexactly = AsyncMock(side_effect=[length_prefix, encrypted_data])
+    # Act
+    await communication_manager._listener()
     
-    await cm._listener()
-    
-    assert cm.command_queue.empty()
-    assert not cm.result_queue.empty()
+    # Assert: The listener exited immediately without queuing anything
+    assert communication_manager.command_queue.empty() is True
+    mock_logger.assert_called_once_with("Failed to decrypt message")
 
 
 @pytest.mark.asyncio
-async def test_listener_exits_on_connection_close(cm, peer_em):
-    """Test listener raises IncompleteReadError on connection close"""
-    cm._encryption_manager.establish_session_key(peer_em.public_key_b64)
+async def test_listener_handles_kill_command(mocker, communication_manager):
+    """Test the KILL command executes specific teardown logic."""
+    # Arrange
+    kill_cmd = Mock(type=MessageType.COMMAND, cmd_id="666", command=CommandType.KILL.value)
     
-    mock_reader = AsyncMock()
-    cm._connection_manager.reader = mock_reader
+    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="payload")
+    communication_manager._encryption_manager.decrypt.return_value = kill_cmd
     
-    mock_reader.readexactly = AsyncMock(side_effect=asyncio.IncompleteReadError(b'', 4))
+    mock_handle_kill = mocker.patch.object(communication_manager, '_handle_kill_command', new_callable=AsyncMock)
     
-    with pytest.raises(asyncio.IncompleteReadError):
-        await cm._listener()
+    # Act
+    await communication_manager._listener()
+    
+    # Assert: The listener loop must break after a KILL command
+    mock_handle_kill.assert_awaited_once()
 
+
+# --- 3. TALKER TESTS ---
 
 @pytest.mark.asyncio
-async def test_talker_sends_results(cm, peer_em):
-    """Test talker sends results with real encryption"""
-    cm._encryption_manager.establish_session_key(peer_em.public_key_b64)
-    peer_em.establish_session_key(cm._encryption_manager.public_key_b64)
+async def test_talker_encrypts_and_sends(mocker, communication_manager):
+    """Test that the talker successfully pulls from queue, encrypts, and transmits."""
+    # Arrange
+    await communication_manager.result_queue.put(("cmd-99", "success output", 15.5))
     
-    mock_writer = Mock()
-    written_data = []
+    communication_manager._encryption_manager.encrypt.return_value = "encrypted_bytes"
+    mock_send = mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
     
-    mock_writer.write = Mock(side_effect=lambda d: written_data.append(d))
-    mock_writer.drain = AsyncMock()
+    # Act: Start talker in background
+    talker_task = asyncio.create_task(communication_manager._talker())
     
-    cm._connection_manager.writer = mock_writer
+    # Let the event loop cycle once to process the queue
+    await asyncio.sleep(0) 
     
-    await cm.result_queue.put(("cmd-1", "output", 50.0))
-    
-    talker_task = asyncio.create_task(cm._talker())
-    
-    # Wait for message to be written
-    await asyncio.sleep(0.2)
-    
+    # Cleanup: Cancel task
     talker_task.cancel()
-    try:
+    with pytest.raises(asyncio.CancelledError):
         await talker_task
-    except asyncio.CancelledError:
-        pass
+        
+    # Assert
+    mock_send.assert_awaited_once()
+    communication_manager._encryption_manager.encrypt.assert_called_once()
+
+
+# --- 4. ORCHESTRATION & STATE MACHINE TESTS ---
+
+@pytest.mark.asyncio
+async def test_start_communication_shuts_down_on_handshake_failure(mocker, communication_manager):
+    """Test that if wait_connected passes but handshake fails, the manager shuts down."""
+    # Arrange: Connection works, Handshake fails
+    communication_manager._connection_manager.wait_connected.side_effect = [True, False]
+    mocker.patch.object(communication_manager, '_perform_handshake', new_callable=AsyncMock, return_value=False)
     
-    assert len(written_data) == 1
-    encrypted_msg = written_data[0]
+    mock_start_loop = mocker.patch.object(communication_manager, '_start_message_loop', new_callable=AsyncMock)
     
-    decrypted = peer_em.decrypt(encrypted_msg[4:])
-    assert decrypted is not None
-    assert decrypted.type == MessageType.RESULT
-    assert decrypted.cmd_id == "cmd-1"
-    assert decrypted.result == "output"
+    # Act
+    await communication_manager.start_communication()
+    
+    # Assert: Must NOT start message loop, MUST call shutdown
+    mock_start_loop.assert_not_called()
+    communication_manager._connection_manager.shutdown.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_cleanup_tasks_cancels_properly(cm):
-    """Test that cleanup cancels tasks properly"""
-    cm._listener_task = asyncio.create_task(asyncio.sleep(10))
-    cm._talker_task = asyncio.create_task(asyncio.sleep(10))
-    cm._active.set()
+async def test_handle_kill_command_drains_queues_and_injects_poison_pill(mocker, communication_manager):
+    """Test _handle_kill_command properly sanitizes state and sends final result."""
+    # Arrange: Pre-fill queues
+    await communication_manager.command_queue.put("old_cmd")
+    await communication_manager.result_queue.put("old_result")
     
-    await cm._cleanup_tasks()
+    # Act
+    await communication_manager._handle_kill_command()
     
-    # Give tasks a moment to process cancellation
-    try:
-        await asyncio.wait_for(asyncio.gather(cm._listener_task, cm._talker_task, return_exceptions=True), timeout=0.1)
-    except asyncio.TimeoutError:
-        pass
+    # Assert: Old data is gone
+    assert communication_manager.command_queue.empty() is True
     
-    assert not cm.is_active
-    assert cm._listener_task.done()
-    assert cm._talker_task.done()
-
+    # Assert: Poison pill was injected
+    assert communication_manager.result_queue.qsize() == 1
+    final_result = await communication_manager.result_queue.get()
+    assert final_result == ('666', 'KILLED BY SERVER', 0)
+    
+    # Assert: Connection manager instructed to shutdown
+    communication_manager._connection_manager.shutdown.assert_awaited_once()
 
 @pytest.mark.asyncio
-async def test_handle_kill_drains_queues(cm):
-    """Test that kill command drains queues"""
-    await cm.command_queue.put({"cmd_id": "1", "command": "test"})
+async def test_start_communication_triggers_reconnection_on_connection_loss(mocker, communication_manager):
+    """Test that if the message loop finishes (e.g., due to connection loss), it triggers a reconnection."""
+    # Arrange: Simulate the connection manager being connected twice, then disconnected
+    communication_manager._connection_manager.wait_connected.side_effect = [True, True, False]
     
-    cm._connection_manager.shutdown = AsyncMock()
+    # Arrange: Handshake always succeeds
+    mocker.patch.object(communication_manager, '_perform_handshake', new_callable=AsyncMock, return_value=True)
     
-    await cm._handle_kill_command()
+    # Arrange: Simulate the message loop running, but returning (simulating a dropped connection)
+    mock_msg_loop = mocker.patch.object(communication_manager, '_start_message_loop', new_callable=AsyncMock)
     
-    assert cm.command_queue.empty()
-    assert not cm.result_queue.empty()
+    # Act
+    await communication_manager.start_communication()
+    
+    # Assert: It should have started the message loop twice
+    assert mock_msg_loop.call_count == 2
+    
+    # Assert: It MUST have triggered reconnection twice to keep the agent alive
+    assert communication_manager._connection_manager.trigger_reconnection.call_count == 2
+    
+    # Assert: Once wait_connected returned False, it shut down cleanly
+    communication_manager._connection_manager.shutdown.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_talker_continues_on_send_failure(mocker, communication_manager):
+    """Test that a failure to send one result does not crash the talker loop."""
+    # Arrange: Queue two results
+    await communication_manager.result_queue.put(("cmd-1", "failed_result", 10.0))
+    await communication_manager.result_queue.put(("cmd-2", "success_result", 12.0))
+    
+    communication_manager._encryption_manager.encrypt.return_value = b"encrypted_dummy"
+    
+    # Simulate the first send failing, and the second succeeding
+    mocker.patch(
+        'models.communication_manager.send_message', 
+        new_callable=AsyncMock, 
+        side_effect=[False, True]
+    )
+    mock_logger = mocker.patch('models.communication_manager.logger.warning')
+    
+    # Act: Start talker
+    talker_task = asyncio.create_task(communication_manager._talker())
+    
+    # Yield control to the event loop so the talker can process both items
+    await asyncio.sleep(0.01) 
+    
+    # Cleanup
+    talker_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await talker_task
+        
+    # Assert: Both items were pulled from the queue
+    assert communication_manager.result_queue.empty() is True
+    
+    # Assert: The warning was logged for the first failure
+    mock_logger.assert_called_once_with("[cmd id: cmd-1] Failed to send result")
+
+@pytest.mark.asyncio
+async def test_listener_breaks_on_empty_message(mocker, communication_manager):
+    """Test that a dropped TCP connection (empty message) cleanly exits the listener."""
+    # Arrange: Simulate a silent network drop
+    mocker.patch(
+        'models.communication_manager.receive_message', 
+        new_callable=AsyncMock, 
+        return_value=None
+    )
+    
+    # Spy on the logger to verify the exact code path
+    mock_logger = mocker.patch('models.communication_manager.logger.warning')
+    
+    # Act
+    await communication_manager._listener()
+    
+    # Assert: The loop broke without erroring out
+    mock_logger.assert_called_once_with("Received empty message")
+    communication_manager._encryption_manager.decrypt.assert_not_called()
