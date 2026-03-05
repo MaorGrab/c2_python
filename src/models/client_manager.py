@@ -84,7 +84,7 @@ class ClientManager:
     
     async def close_all_clients(self):
         """Close all client connections"""
-        for client_state in self.clients.values():
+        for client_state in list(self.clients.values()):
             await client_state._cleanup_connection()
         self.clients.clear()
     

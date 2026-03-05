@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 class C2Server:
     """Main C2 Server"""
     
-    def __init__(self, host: str, port: int, master_key: bytes):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         self.shutdown = asyncio.Event()

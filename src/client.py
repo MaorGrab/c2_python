@@ -49,7 +49,7 @@ class C2Client:
         except Exception as e:
             logger.error(f"Client error: {e}")
         finally:
-            # self.executor.stop()
+            self.executor.stop()
             await helper_funcs.cancel_task(self._executor_task)
             logger.info("C2 Client stopped")
 
