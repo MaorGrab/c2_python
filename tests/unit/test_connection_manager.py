@@ -4,11 +4,11 @@ import asyncio
 @pytest.mark.asyncio
 async def test_open_connection_refused(mocker, connection_manager):
     # Arrange: Mock the SSL context to avoid unrelated errors
-    mocker.patch('models.connection_manager.TLSSessionHelper')
+    mocker.patch('models.client.connection_manager.TLSSessionHelper')
     
     # Arrange: Force the connection to fail
     mocker.patch(
-        'models.connection_manager.asyncio.open_connection', 
+        'models.client.connection_manager.asyncio.open_connection', 
         side_effect=ConnectionRefusedError("Connection refused")
     )
     
@@ -63,7 +63,7 @@ async def test_reconnection_loop_recovers(mocker, connection_manager):
     mock_open = mocker.patch.object(
         connection_manager, '_open_connection', side_effect=[False, True]
     )
-    mock_sleep = mocker.patch('models.connection_manager.asyncio.sleep', new_callable=mocker.AsyncMock)
+    mock_sleep = mocker.patch('models.client.connection_manager.asyncio.sleep', new_callable=mocker.AsyncMock)
     mock_reset = mocker.patch.object(connection_manager, '_reset_streams')
     
     # Act: Start the loop as a task so it doesn't block
@@ -85,7 +85,7 @@ async def test_shutdown_cancels_active_task(mocker, connection_manager):
     """Test that an active task is properly cancelled and state is cleared."""
     # Arrange: Mock the external cancel_task helper (it's an async function)
     mock_cancel = mocker.patch(
-        'models.connection_manager.cancel_task', 
+        'models.client.connection_manager.cancel_task', 
         new_callable=mocker.AsyncMock
     )
     
@@ -112,7 +112,7 @@ async def test_shutdown_inactive_is_noop(mocker, connection_manager):
     """Test that calling shutdown when already inactive does nothing."""
     # Arrange: Mock the external helper
     mock_cancel = mocker.patch(
-        'models.connection_manager.cancel_task', 
+        'models.client.connection_manager.cancel_task', 
         new_callable=mocker.AsyncMock
     )
     
@@ -175,17 +175,17 @@ async def test_reconnection_loop_cleans_up_on_cancel(mocker, connection_manager)
 async def test_open_connection_invalid_certificate(mocker, connection_manager):
     """Test connection aborts if the server certificate is invalid."""
     # Arrange: Simulate successful network stream creation
-    mocker.patch('models.connection_manager.TLSSessionHelper')
+    mocker.patch('models.client.connection_manager.TLSSessionHelper')
     mock_reader = mocker.AsyncMock()
     mock_writer = mocker.Mock()
     mocker.patch(
-        'models.connection_manager.asyncio.open_connection', 
+        'models.client.connection_manager.asyncio.open_connection', 
         return_value=(mock_reader, mock_writer)
     )
     
     # Arrange: Force the security validation to FAIL
     mocker.patch(
-        'models.connection_manager.validate_server_certificate', 
+        'models.client.connection_manager.validate_server_certificate', 
         return_value=False
     )
     
@@ -199,7 +199,7 @@ async def test_open_connection_invalid_certificate(mocker, connection_manager):
 async def test_start_idempotency_prevents_duplicate_loops(mocker, connection_manager):
     """Test that calling start() twice does not spawn duplicate background tasks."""
     # Arrange: Spy on the logger to verify the warning
-    mock_logger = mocker.patch('models.connection_manager.logger.warning')
+    mock_logger = mocker.patch('models.client.connection_manager.logger.warning')
     
     # Arrange: Simulate an already active state by injecting a dummy task
     connection_manager._reconnection_task = mocker.Mock()

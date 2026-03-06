@@ -2,8 +2,8 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, Mock, call
 
-from models.message_type import MessageType
-from models.command_type import CommandType
+from models.protocol.message_type import MessageType
+from models.protocol.command_type import CommandType
 
 # --- 1. STATE & QUEUE MANAGEMENT ---
 
@@ -51,7 +51,7 @@ async def test_command_executor_encrypts_and_sends(mocker, client_state):
     cmd_id = client_state.add_command("ipconfig")
     
     # Mock transmission
-    mock_send = mocker.patch('models.client_state.send_message', new_callable=AsyncMock)
+    mock_send = mocker.patch('models.server.client_state.send_message', new_callable=AsyncMock)
     
     # Act: Start the executor loop
     executor_task = asyncio.create_task(client_state._command_executor())
@@ -110,7 +110,7 @@ async def test_receiver_clears_pending_on_valid_result(mocker, client_state):
     # Arrange: Mock receiving a valid result message
     mock_result_msg = Mock(type=MessageType.RESULT, cmd_id="cmd-123", result="root")
     mocker.patch(
-        'models.client_state.receive_message', 
+        'models.server.client_state.receive_message', 
         new_callable=AsyncMock, 
         side_effect=[b"raw_data", b""] 
     )
@@ -134,7 +134,7 @@ async def test_receiver_handles_network_disconnect(mocker, client_state):
     """Test that an IncompleteReadError properly triggers the disconnection handler."""
     # Arrange: Simulate connection drop
     mocker.patch(
-        'models.client_state.receive_message', 
+        'models.server.client_state.receive_message', 
         new_callable=AsyncMock, 
         side_effect=asyncio.IncompleteReadError(b'', None)
     )
@@ -187,7 +187,7 @@ async def test_receiver_ignores_untracked_results(mocker, client_state):
     
     # Use our one-two punch to run the loop exactly once
     mocker.patch(
-        'models.client_state.receive_message', 
+        'models.server.client_state.receive_message', 
         new_callable=AsyncMock, 
         side_effect=[b"data", b""]
     )
@@ -206,12 +206,12 @@ async def test_receiver_skips_wrong_message_types(mocker, client_state):
     mock_bad_msg = Mock(type=MessageType.COMMAND) 
     
     mocker.patch(
-        'models.client_state.receive_message', 
+        'models.server.client_state.receive_message', 
         new_callable=AsyncMock, 
         side_effect=[b"data", b""]
     )
     client_state._encryption_manager.decrypt.return_value = mock_bad_msg
-    mock_logger = mocker.patch('models.client_state.logger.warning')
+    mock_logger = mocker.patch('models.server.client_state.logger.warning')
 
     # Act
     await client_state._message_receiver()
@@ -244,7 +244,7 @@ async def test_cleanup_connection_wipes_pointers_on_timeout(mocker, client_state
     client_state.writer.wait_closed = AsyncMock(side_effect=asyncio.TimeoutError())
     
     # Spy on the logger to verify the exact branch
-    mock_logger = mocker.patch('models.client_state.logger.info')
+    mock_logger = mocker.patch('models.server.client_state.logger.info')
     
     # Act
     await client_state._cleanup_connection()

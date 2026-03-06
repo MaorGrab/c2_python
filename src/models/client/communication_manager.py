@@ -1,12 +1,12 @@
 import asyncio
 import logging
 from typing import Optional
-from models.message import Message
-from models.send_receive_msgs import send_message, receive_message
-from models.message_type import MessageType
-from models.command_type import CommandType
-from models.encryption_manager import EncryptionManager
-from models.connection_manager import ConnectionManager
+from models.protocol.message import Message
+from models.network.send_receive_msgs import send_message, receive_message
+from models.protocol.message_type import MessageType
+from models.protocol.command_type import CommandType
+from models.security.encryption_manager import EncryptionManager
+from models.client.connection_manager import ConnectionManager
 from helper.helper_funcs import drain_queue, cancel_task
 
 logger = logging.getLogger(__name__)

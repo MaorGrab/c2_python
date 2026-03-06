@@ -10,15 +10,15 @@ src_path = Path(__file__).parent.parent / 'src'
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
-from models.connection_manager import ConnectionManager
-from models.command_executor import CommandExecutor
-from models.communication_manager import CommunicationManager
-from models.client_state import ClientState
-from models.connection_status import ConnectionStatus
-from models.client_manager import ClientManager
-from models.encryption_manager import EncryptionManager
-from models.message import Message
-from models.message_type import MessageType
+from models.client.connection_manager import ConnectionManager
+from models.client.command_executor import CommandExecutor
+from models.client.communication_manager import CommunicationManager
+from models.server.client_state import ClientState
+from models.protocol.connection_status import ConnectionStatus
+from models.server.client_manager import ClientManager
+from models.security.encryption_manager import EncryptionManager
+from models.protocol.message import Message
+from models.protocol.message_type import MessageType
 
 @pytest_asyncio.fixture
 async def connection_manager():

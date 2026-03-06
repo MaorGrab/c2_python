@@ -12,12 +12,12 @@ async def test_terminate_process_falls_back_to_forceful_on_timeout(mocker, execu
     executor.execution_process = mock_process
     
     mock_graceful = mocker.patch(
-        'models.command_executor.subprocess_helper.terminate_subprocess_gracefully',
+        'models.client.command_executor.subprocess_helper.terminate_subprocess_gracefully',
         new_callable=AsyncMock,
         side_effect=asyncio.TimeoutError()
     )
     mock_forceful = mocker.patch(
-        'models.command_executor.subprocess_helper.terminate_subprocess_forcefully',
+        'models.client.command_executor.subprocess_helper.terminate_subprocess_forcefully',
         new_callable=AsyncMock
     )
     
@@ -33,12 +33,12 @@ async def test_execute_command_cleans_up_on_cancellation(mocker, executor):
     """Test that if execution is cancelled mid-flight, the process is terminated."""
     mock_process = mocker.Mock()
     mocker.patch(
-        'models.command_executor.subprocess_helper.create_subprocess',
+        'models.client.command_executor.subprocess_helper.create_subprocess',
         new_callable=AsyncMock,
         return_value=mock_process
     )
     mocker.patch(
-        'models.command_executor.subprocess_helper.communicate_subprocess',
+        'models.client.command_executor.subprocess_helper.communicate_subprocess',
         new_callable=AsyncMock,
         side_effect=asyncio.CancelledError()
     )
@@ -58,7 +58,7 @@ async def test_execute_command_handles_standard_exceptions(mocker, executor):
     """Test that general exceptions are caught and formatted as string errors."""
     error_message = "Permission denied"
     mocker.patch(
-        'models.command_executor.subprocess_helper.create_subprocess',
+        'models.client.command_executor.subprocess_helper.create_subprocess',
         new_callable=AsyncMock,
         side_effect=PermissionError(error_message)
     )
@@ -109,7 +109,7 @@ async def test_start_skips_none_in_queue(mocker, executor, command_queues):
     """Test that receiving None in the queue logs a warning and continues."""
     in_queue, out_queue = command_queues
     
-    mock_logger = mocker.patch('models.command_executor.logger.warning')
+    mock_logger = mocker.patch('models.client.command_executor.logger.warning')
     mocker.patch.object(
         executor, '_process_command',
         new_callable=AsyncMock,

@@ -1,7 +1,7 @@
 import pytest
 import json
-from models.message import Message
-from models.message_type import MessageType
+from models.protocol.message import Message
+from models.protocol.message_type import MessageType
 
 # --- 1. FACTORY METHOD TESTS ---
 

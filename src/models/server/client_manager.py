@@ -6,10 +6,10 @@ import asyncio
 import logging
 import time
 from typing import Dict, Optional
-from .client_state import ClientState
-from .message import Message
-from .message_type import MessageType
-from .send_receive_msgs import send_message, receive_message
+from models.server.client_state import ClientState
+from models.protocol.message import Message
+from models.protocol.message_type import MessageType
+from models.network.send_receive_msgs import send_message, receive_message
 
 logger = logging.getLogger(__name__)
 

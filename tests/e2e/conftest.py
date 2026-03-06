@@ -2,7 +2,7 @@ import pytest_asyncio
 import asyncio
 from client import C2Client
 from server import C2Server
-from c2_python.src.models.client_state import ClientState
+from c2_python.src.models.server.client_state import ClientState
 from c2_python.tests.utils import poll_until
 
 
@@ -81,7 +81,7 @@ def captured_results(mocker):
         await original_handle_result(self_instance, msg)  # Execute original behavior
         
     # Apply the patch 
-    mocker.patch("models.client_manager.ClientState._handle_result", capture_wrapper)
+    mocker.patch("models.server.client_manager.ClientState._handle_result", capture_wrapper)
     
     # Return the live list to the test
     return captured

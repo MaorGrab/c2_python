@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 
-from models.message import Message
+from models.protocol.message import Message
 
 
 class EncryptionManager:

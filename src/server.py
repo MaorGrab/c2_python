@@ -16,12 +16,12 @@ import uuid
 import argparse
 import base64
 from typing import Dict, List
-from models.message import Message
-from models.send_receive_msgs import send_message, receive_message
-from models.client_manager import ClientManager
-from models.message_type import MessageType
-from models.command_type import CommandType
-from models.tls_helper import TLSSessionHelper
+from models.protocol.message import Message
+from models.network.send_receive_msgs import send_message, receive_message
+from models.server.client_manager import ClientManager
+from models.protocol.message_type import MessageType
+from models.protocol.command_type import CommandType
+from models.security.tls_helper import TLSSessionHelper
 
 # ==================== CONFIGURATION ====================
 

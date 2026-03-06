@@ -3,12 +3,12 @@ import time
 import uuid
 import logging
 from typing import Optional
-from .connection_status import ConnectionStatus
-from .encryption_manager import EncryptionManager
-from .message import Message
-from .message_type import MessageType
-from .command_type import CommandType
-from .send_receive_msgs import send_message, receive_message
+from models.protocol.connection_status import ConnectionStatus
+from models.security.encryption_manager import EncryptionManager
+from models.protocol.message import Message
+from models.protocol.message_type import MessageType
+from models.protocol.command_type import CommandType
+from models.network.send_receive_msgs import send_message, receive_message
 
 logger = logging.getLogger(__name__)
 

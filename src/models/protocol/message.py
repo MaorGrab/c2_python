@@ -6,7 +6,7 @@ Defines message structure for client-server communication
 import json
 from typing import Optional
 from dataclasses import dataclass, asdict
-from models.message_type import MessageType
+from models.protocol.message_type import MessageType
 
 
 @dataclass

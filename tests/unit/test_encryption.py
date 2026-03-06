@@ -2,8 +2,8 @@ import pytest
 import json
 import base64
 import binascii
-from models.message import Message
-from models.command_type import CommandType
+from models.protocol.message import Message
+from models.protocol.command_type import CommandType
 
 # --- 1. STATE & HANDSHAKE TESTS ---
 

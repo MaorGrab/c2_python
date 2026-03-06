@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock
 
-from models.message import Message
+from models.protocol.message import Message
 
 # --- 1. REGISTRATION LOGIC (THE FACTORY) ---
 
@@ -15,16 +15,16 @@ async def test_register_client_success(mocker, client_manager, mock_streams):
     
     # Arrange: Mock incoming registration message
     mock_reg_msg = Message.as_register(client_id, client_public_key)
-    mocker.patch('models.client_manager.receive_message', new_callable=AsyncMock, return_value=b"raw_data")
-    mocker.patch('models.client_manager.Message.from_payload', return_value=mock_reg_msg)
+    mocker.patch('models.server.client_manager.receive_message', new_callable=AsyncMock, return_value=b"raw_data")
+    mocker.patch('models.server.client_manager.Message.from_payload', return_value=mock_reg_msg)
     
     # Arrange: Mock the ClientState initialization so we don't trigger real crypto
     mock_client_state = mocker.Mock()
     mock_client_state.setup_encryption.return_value = server_public_key
-    mocker.patch('models.client_manager.ClientState', return_value=mock_client_state)
+    mocker.patch('models.server.client_manager.ClientState', return_value=mock_client_state)
     
     # Arrange: Mock outgoing ACK
-    mock_send = mocker.patch('models.client_manager.send_message', new_callable=AsyncMock)
+    mock_send = mocker.patch('models.server.client_manager.send_message', new_callable=AsyncMock)
     
     # Act
     result = await client_manager.register_client(reader, writer)
@@ -46,8 +46,8 @@ async def test_register_client_rejects_invalid_message_type(mocker, client_manag
     
     # Arrange: Mock a rogue COMMAND message instead of a REGISTER message
     rogue_msg = Message.as_command("cmd-1", "whoami")
-    mocker.patch('models.client_manager.receive_message', new_callable=AsyncMock, return_value=b"raw_data")
-    mocker.patch('models.client_manager.Message.from_payload', return_value=rogue_msg)
+    mocker.patch('models.server.client_manager.receive_message', new_callable=AsyncMock, return_value=b"raw_data")
+    mocker.patch('models.server.client_manager.Message.from_payload', return_value=rogue_msg)
     
     # Act
     result = await client_manager.register_client(reader, writer)
@@ -63,7 +63,7 @@ async def test_register_client_handles_receive_exception(mocker, client_manager,
     reader, writer = mock_streams
     
     # Arrange: Force receive_message to throw an error
-    mocker.patch('models.client_manager.receive_message', new_callable=AsyncMock, side_effect=ConnectionResetError)
+    mocker.patch('models.server.client_manager.receive_message', new_callable=AsyncMock, side_effect=ConnectionResetError)
     
     # Act
     result = await client_manager.register_client(reader, writer)

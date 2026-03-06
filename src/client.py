@@ -2,8 +2,8 @@ import asyncio
 import logging
 import uuid
 import argparse
-from models.communication_manager import CommunicationManager
-from models.command_executor import CommandExecutor
+from models.client.communication_manager import CommunicationManager
+from models.client.command_executor import CommandExecutor
 import helper.helper_funcs as helper_funcs
 
 # ==================== CONFIGURATION ====================

@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 
-from models.send_receive_msgs import send_message, receive_message
+from models.network.send_receive_msgs import send_message, receive_message
 
 # --- 1. SEND MESSAGE TESTS ---
 
@@ -23,7 +23,7 @@ async def test_send_message_fails_gracefully_on_write_error(mocker, mock_streams
     """Test that a synchronous buffer write failure is caught and logged."""
     _, mock_writer = mock_streams
     mock_writer.write.side_effect = Exception("Buffer full")
-    mock_logger = mocker.patch('models.send_receive_msgs.logger.error')
+    mock_logger = mocker.patch('models.network.send_receive_msgs.logger.error')
     
     result = await send_message(mock_writer, b"data")
     
@@ -37,7 +37,7 @@ async def test_send_message_fails_gracefully_on_drain_error(mocker, mock_streams
     """Test that an asynchronous network drain failure is caught and logged."""
     _, mock_writer = mock_streams
     mock_writer.drain.side_effect = ConnectionResetError("Peer closed")
-    mock_logger = mocker.patch('models.send_receive_msgs.logger.error')
+    mock_logger = mocker.patch('models.network.send_receive_msgs.logger.error')
     
     result = await send_message(mock_writer, b"data")
     
@@ -98,7 +98,7 @@ async def test_receive_message_bubbles_up_connection_reset(mocker, mock_streams)
     """Test that aggressive TCP drops (RST packets) are logged and bubbled up."""
     mock_reader, _ = mock_streams
     mock_reader.readexactly.side_effect = ConnectionResetError("RST")
-    mock_logger = mocker.patch('models.send_receive_msgs.logger.info')
+    mock_logger = mocker.patch('models.network.send_receive_msgs.logger.info')
     
     with pytest.raises(ConnectionResetError):
         await receive_message(mock_reader)
@@ -111,7 +111,7 @@ async def test_receive_message_absorbs_generic_exceptions(mocker, mock_streams):
     """Test that unknown errors safely return None instead of crashing the listener loop."""
     mock_reader, _ = mock_streams
     mock_reader.readexactly.side_effect = Exception("Corrupt memory")
-    mock_logger = mocker.patch('models.send_receive_msgs.logger.error')
+    mock_logger = mocker.patch('models.network.send_receive_msgs.logger.error')
     
     result = await receive_message(mock_reader)
     
@@ -131,7 +131,7 @@ async def test_receive_message_catches_dos_memory_errors(mocker, mock_streams):
         malicious_prefix, 
         MemoryError("Out of memory")
     ]
-    mock_logger = mocker.patch('models.send_receive_msgs.logger.error')
+    mock_logger = mocker.patch('models.network.send_receive_msgs.logger.error')
     
     result = await receive_message(mock_reader)
     

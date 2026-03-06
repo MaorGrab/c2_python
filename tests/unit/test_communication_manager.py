@@ -2,9 +2,9 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
-from models.message import Message
-from models.message_type import MessageType
-from models.command_type import CommandType
+from models.protocol.message import Message
+from models.protocol.message_type import MessageType
+from models.protocol.command_type import CommandType
 
 # --- 1. HANDSHAKE TESTS ---
 
@@ -12,12 +12,12 @@ from models.command_type import CommandType
 async def test_handshake_success(mocker, communication_manager):
     """Test successful handshake logic sets session key."""
     # Arrange: Mock send success
-    mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
+    mocker.patch('models.client.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
     
     # Arrange: Mock receive success with valid ACK
     mock_ack_msg = Message.as_ack("server", "server_public_key")
-    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
-    mocker.patch('models.communication_manager.Message.from_payload', return_value=mock_ack_msg)
+    mocker.patch('models.client.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
+    mocker.patch('models.client.communication_manager.Message.from_payload', return_value=mock_ack_msg)
     
     # Act
     result = await communication_manager._perform_handshake()
@@ -29,12 +29,12 @@ async def test_handshake_success(mocker, communication_manager):
 @pytest.mark.asyncio
 async def test_handshake_fails_on_invalid_ack(mocker, communication_manager):
     """Test handshake fails if server returns something other than an ACK."""
-    mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
-    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
+    mocker.patch('models.client.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
+    mocker.patch('models.client.communication_manager.receive_message', new_callable=AsyncMock, return_value="mock_payload")
     
     # Mock a COMMAND message instead of an ACK
     invalid_msg = Message.as_command("cmd-1", "whoami")
-    mocker.patch('models.communication_manager.Message.from_payload', return_value=invalid_msg)
+    mocker.patch('models.client.communication_manager.Message.from_payload', return_value=invalid_msg)
     
     result = await communication_manager._perform_handshake()
     
@@ -53,7 +53,7 @@ async def test_listener_routes_commands_and_skips_non_commands(mocker, communica
     
     # Setup the receive loop to yield 2 items, then gracefully exit with None
     mocker.patch(
-        'models.communication_manager.receive_message', 
+        'models.client.communication_manager.receive_message', 
         new_callable=AsyncMock, 
         side_effect=["payload_ack", "payload_cmd", None]
     )
@@ -78,7 +78,7 @@ async def test_listener_aborts_on_decryption_failure(mocker, communication_manag
     """Test listener intentionally breaks the loop to force a reconnection if decryption fails."""
     # Arrange: Mock a received message
     mocker.patch(
-        'models.communication_manager.receive_message', 
+        'models.client.communication_manager.receive_message', 
         new_callable=AsyncMock, 
         return_value="corrupted_payload"
     )
@@ -87,7 +87,7 @@ async def test_listener_aborts_on_decryption_failure(mocker, communication_manag
     communication_manager._encryption_manager.decrypt.return_value = None
     
     # Spy on the logger to ensure the warning fires
-    mock_logger = mocker.patch('models.communication_manager.logger.warning')
+    mock_logger = mocker.patch('models.client.communication_manager.logger.warning')
     
     # Act
     await communication_manager._listener()
@@ -103,7 +103,7 @@ async def test_listener_handles_kill_command(mocker, communication_manager):
     # Arrange
     kill_cmd = Mock(type=MessageType.COMMAND, cmd_id="666", command=CommandType.KILL.value)
     
-    mocker.patch('models.communication_manager.receive_message', new_callable=AsyncMock, return_value="payload")
+    mocker.patch('models.client.communication_manager.receive_message', new_callable=AsyncMock, return_value="payload")
     communication_manager._encryption_manager.decrypt.return_value = kill_cmd
     
     mock_handle_kill = mocker.patch.object(communication_manager, '_handle_kill_command', new_callable=AsyncMock)
@@ -124,7 +124,7 @@ async def test_talker_encrypts_and_sends(mocker, communication_manager):
     await communication_manager.result_queue.put(("cmd-99", "success output", 15.5))
     
     communication_manager._encryption_manager.encrypt.return_value = "encrypted_bytes"
-    mock_send = mocker.patch('models.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
+    mock_send = mocker.patch('models.client.communication_manager.send_message', new_callable=AsyncMock, return_value=True)
     
     # Act: Start talker in background
     talker_task = asyncio.create_task(communication_manager._talker())
@@ -217,11 +217,11 @@ async def test_talker_continues_on_send_failure(mocker, communication_manager):
     
     # Simulate the first send failing, and the second succeeding
     mocker.patch(
-        'models.communication_manager.send_message', 
+        'models.client.communication_manager.send_message', 
         new_callable=AsyncMock, 
         side_effect=[False, True]
     )
-    mock_logger = mocker.patch('models.communication_manager.logger.warning')
+    mock_logger = mocker.patch('models.client.communication_manager.logger.warning')
     
     # Act: Start talker
     talker_task = asyncio.create_task(communication_manager._talker())
@@ -245,13 +245,13 @@ async def test_listener_breaks_on_empty_message(mocker, communication_manager):
     """Test that a dropped TCP connection (empty message) cleanly exits the listener."""
     # Arrange: Simulate a silent network drop
     mocker.patch(
-        'models.communication_manager.receive_message', 
+        'models.client.communication_manager.receive_message', 
         new_callable=AsyncMock, 
         return_value=None
     )
     
     # Spy on the logger to verify the exact code path
-    mock_logger = mocker.patch('models.communication_manager.logger.warning')
+    mock_logger = mocker.patch('models.client.communication_manager.logger.warning')
     
     # Act
     await communication_manager._listener()

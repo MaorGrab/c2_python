@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 
-from models.tls_helper import TLSSessionHelper
+from models.security.tls_helper import TLSSessionHelper
 from helper.auth import validate_server_certificate
 from helper.helper_funcs import cancel_task
 
