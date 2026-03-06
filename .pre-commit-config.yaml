@@ -12,7 +12,7 @@ repos:
     hooks:
       - id: run-unit-tests
         name: Run Unit Tests
-        entry: bash -c 'PYTHONPATH=. pytest tests/unit -v'
+        entry: python -m pytest tests/unit -vv -s
         language: system
         types: [python]
         pass_filenames: false

@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock
 
-from c2_python.src.models.message import Message
+from models.message import Message
 
 # --- 1. REGISTRATION LOGIC (THE FACTORY) ---
 

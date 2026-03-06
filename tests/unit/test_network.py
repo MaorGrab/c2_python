@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 
-from c2_python.src.models.send_receive_msgs import send_message, receive_message
+from models.send_receive_msgs import send_message, receive_message
 
 # --- 1. SEND MESSAGE TESTS ---
 

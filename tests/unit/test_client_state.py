@@ -2,8 +2,8 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, Mock, call
 
-from c2_python.src.models.message_type import MessageType
-from c2_python.src.models.command_type import CommandType
+from models.message_type import MessageType
+from models.command_type import CommandType
 
 # --- 1. STATE & QUEUE MANAGEMENT ---
 
