@@ -1,26 +1,35 @@
 """
 Test runner for C2 project
-Discovers and runs all unit tests
+Runs pytest test suite with coverage
 """
 
 import sys
-import unittest
-from pathlib import Path
+import subprocess
 
-# Add src to path
-src_path = Path(__file__).parent / 'src'
-sys.path.insert(0, str(src_path.parent))
 
 def run_tests():
-    """Discover and run all tests"""
-    loader = unittest.TestLoader()
-    start_dir = 'tests/unit'
-    suite = loader.discover(start_dir, pattern='test_*.py')
+    """Run pytest with coverage"""
+    cmd = [
+        sys.executable, '-m', 'pytest',
+        'tests/',
+        '-v',
+        '--cov=src',
+        '--cov-report=term-missing',
+        '--cov-report=html',
+        '-m', 'not performance',
+        '--tb=short'
+    ]
     
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-    
-    return 0 if result.wasSuccessful() else 1
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+def run_all_tests():
+    """Run all tests including performance"""
+    cmd = [sys.executable, '-m', 'pytest', 'tests/', '-v', '--cov=src']
+    result = subprocess.run(cmd)
+    return result.returncode
+
 
 if __name__ == '__main__':
     sys.exit(run_tests())
