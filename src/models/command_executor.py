@@ -22,6 +22,8 @@ class CommandExecutor:
                 if command_data is None:
                     logger.warning("Received None command")
                     continue
+                if self._should_stop:
+                    break
                 cmd_id = command_data.get("cmd_id")
                 command = command_data.get("command", "").lower()
                 

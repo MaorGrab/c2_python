@@ -75,6 +75,7 @@ class C2Server:
             ssl=ssl_ctx
         )
         addr = self._server.sockets[0].getsockname()
+        self.port = self.port or addr[1]  # if port was 0, get actual port
         logger.info(f"C2 Server listening on {addr[0]}:{addr[1]}")
         async with self._server:
             try:

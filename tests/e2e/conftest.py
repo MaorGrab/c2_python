@@ -1,25 +1,16 @@
 import pytest_asyncio
-import pytest
 import asyncio
-import time
 from client import C2Client
 from server import C2Server
 from c2_python.src.models.client_state import ClientState
+from c2_python.tests.utils import poll_until
 
-async def poll_until(condition_func, timeout=5.0):
-    """Polls a condition function until it returns True or times out."""
-    start = time.time()
-    while time.time() - start < timeout:
-        if condition_func():
-            return True
-        await asyncio.sleep(0.1)
-    return False
 
 @pytest_asyncio.fixture
 async def make_server():
     servers = []  # Keep track for emergency cleanup
 
-    async def _create_server(port=0):
+    async def _create_server(port: int = 0):
         server = C2Server("127.0.0.1", port)
         # We store the task on the object so we can find it later
         server._test_task = asyncio.create_task(server.start_server())
@@ -46,8 +37,8 @@ async def make_server():
 async def make_client():
     clients = []
 
-    async def _create_client(port):
-        client = C2Client("127.0.0.1", port, "e2e-test-agent")
+    async def _create_client(port: int, id_: str = 'test-agent'):
+        client = C2Client("127.0.0.1", port, id_)
         client._test_task = asyncio.create_task(client.start())
         clients.append(client)
         return client
@@ -64,8 +55,6 @@ async def make_client():
 
 @pytest_asyncio.fixture
 async def c2_env(make_server, make_client):
-    # FIX: These are async calls now, use 'await'
-    # and they return the actual objects, not generators
     server = await make_server(port=0)
     assigned_port = server._server.sockets[0].getsockname()[1]
     client = await make_client(port=assigned_port)

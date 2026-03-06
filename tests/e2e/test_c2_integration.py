@@ -1,17 +1,8 @@
 import pytest
 import asyncio
-import time
 
-from c2_python.src.models.client_state import ClientState
+from c2_python.tests.utils import poll_until
 
-async def poll_until(condition_func, timeout=5.0):
-    """Polls a condition function until it returns True or times out."""
-    start = time.time()
-    while time.time() - start < timeout:
-        if condition_func():
-            return True
-        await asyncio.sleep(0.1)
-    return False
 
 @pytest.mark.asyncio
 async def test_full_command_roundtrip_in_process(c2_env):
@@ -86,7 +77,7 @@ async def test_mid_execution_kill_aborts_process(c2_env):
 async def test_offline_result_queued_and_delivered_on_reconnect(c2_env, make_server, captured_results, mocker):
     """Test that results generated while offline are saved and sent upon reconnection."""
     server, client = c2_env
-    port = server._server.sockets[0].getsockname()[1]
+    port = server.port
 
     # 1. Issue a command
     desired_result = "offline success"
@@ -147,3 +138,84 @@ async def test_invalid_os_command_handled_gracefully(c2_env):
     
     # 3. Assert the client is still perfectly healthy and its task is not done
     assert not client._executor_task.done(), "Client crashed after executing an invalid command!"
+
+# @pytest.mark.asyncio
+# async def test_concurrent_command_bombardment(c2_env):
+#     """Test that rapid-fire commands are queued and routed back with perfectly matching IDs."""
+#     server, client = c2_env
+#     await poll_until(lambda: client.client_id in server.client_manager.clients)
+#     client_state = server.client_manager.get_client(client.client_id)
+    
+#     # 1. Fire 3 commands back-to-back instantly without waiting
+#     command = "python -c 'import time; time.sleep(1);'"
+#     for _ in range(3):
+#         server.cmd_run(f"{client.client_id} {command}")
+#     await asyncio.sleep(0)  # give brief control to server
+#     # 2. Verify all 3 were immediately registered in the server's tracking dictionary
+#     assert len(client_state.pending_results) == 3, f"Server failed to track concurrent commands {len(client_state.pending_results)}"
+    
+#     # 3. Poll until the queue is completely drained and all 3 results are returned
+#     drained_successfully = await poll_until(
+#         lambda: len(client_state.pending_results) == 0, 
+#         timeout=10.0
+#     )
+    
+#     assert drained_successfully, "Client failed to process and return all concurrent commands"
+
+@pytest.mark.asyncio
+async def test_rogue_socket_isolation(c2_env):
+    """Test that garbage TCP connections do not crash the server for valid clients."""
+    server, valid_client = c2_env
+    await poll_until(lambda: valid_client.client_id in server.client_manager.clients)
+        
+    # 1. Act as a port scanner: Open a raw socket and send garbage
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    writer.write(b"NMAP_SCAN_GARBAGE_BYTES_!!@#$")
+    await writer.drain()
+    
+    # Close the rogue socket abruptly
+    writer.close()
+    await writer.wait_closed()
+    
+    # 2. Give the server a moment to throw and catch the internal exception
+    await asyncio.sleep(0)
+    
+    # 3. Assert the valid client is still perfectly alive and can receive commands
+    server.cmd_run(f"{valid_client.client_id} echo ISOLATION_SUCCESS")
+    
+    client_state = server.client_manager.get_client(valid_client.client_id)
+    assert await poll_until(lambda: len(client_state.pending_results) == 0, timeout=5.0), \
+        "The rogue socket crashed the server's event loop or message router!"
+
+@pytest.mark.asyncio
+async def test_duplicate_client_id_reconnect_overwrite(c2_env, make_client, captured_results):
+    """Test that a new client connecting with an existing ID cleanly hijacks the session."""
+    server, client_1 = c2_env
+    
+    # 1. Wait for Client 1 to be fully registered
+    await poll_until(lambda: client_1.client_id in server.client_manager.clients)
+    
+    # 2. Start Client 2 with the EXACT SAME ID
+    # make_client handles the asyncio task creation and guaranteed teardown!
+    client_2 = await make_client(server.port)
+    
+    # Give the server a moment to accept the new TCP socket and overwrite the registry
+    await asyncio.sleep(0.5)
+    
+    # 3. Sabotage Client 1
+    # We locally kill Client 1. If the server incorrectly routes the next command 
+    # to Client 1's old socket, it drops into the void and the test fails.
+    client_1.executor.stop()
+    
+    # 4. Issue a command to the shared client ID
+    desired_result = "hijack_success"
+    server.cmd_run(f"{client_1.client_id} echo {desired_result}")
+    
+    # 5. ASSERT: Did the interceptor catch the payload from Client 2?
+    # Because Client 1 is dead, ONLY Client 2 can possibly return this result.
+    received = await poll_until(
+        lambda: any(desired_result in res for res in captured_results), 
+        timeout=2.0
+    )
+    
+    assert received, f"Expected '{desired_result}', but captured: {captured_results}"
