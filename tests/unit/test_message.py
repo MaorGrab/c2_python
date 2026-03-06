@@ -1,7 +1,7 @@
 import pytest
 import json
-from models.message import Message
-from models.message_type import MessageType
+from c2_python.src.models.message import Message
+from c2_python.src.models.message_type import MessageType
 
 # --- 1. FACTORY METHOD TESTS ---
 

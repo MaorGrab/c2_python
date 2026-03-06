@@ -1,8 +1,7 @@
 import pytest
 import asyncio
-from unittest.mock import AsyncMock
 
-from models.send_receive_msgs import send_message, receive_message
+from c2_python.src.models.send_receive_msgs import send_message, receive_message
 
 # --- 1. SEND MESSAGE TESTS ---
 

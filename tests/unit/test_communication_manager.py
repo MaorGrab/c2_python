@@ -2,9 +2,9 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
-from models.message import Message
-from models.message_type import MessageType
-from models.command_type import CommandType
+from c2_python.src.models.message import Message
+from c2_python.src.models.message_type import MessageType
+from c2_python.src.models.command_type import CommandType
 
 # --- 1. HANDSHAKE TESTS ---
 

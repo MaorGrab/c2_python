@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 # --- 1. SUBPROCESS & TERMINATION EDGE CASES ---
 
